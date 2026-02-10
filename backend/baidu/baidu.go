@@ -1,3 +1,4 @@
+// Package baidu provides a backend for BaiduYun Drive
 package baidu
 
 import (
@@ -29,10 +30,10 @@ import (
 )
 
 const (
-	openApiUrl = "https://openapi.baidu.com"
-	rootUrl    = "https://pan.baidu.com"
-	uploadUrl  = "https://d.pcs.baidu.com"
-	rootId     = "/"
+	openAPIURL = "https://openapi.baidu.com"
+	rootURL    = "https://pan.baidu.com"
+	uploadURL  = "https://d.pcs.baidu.com"
+	rootID     = "/"
 
 	//uri
 	uriOauthCode  = "/oauth/2.0/device/code"
@@ -114,7 +115,7 @@ func getAccessToken(ctx context.Context, deviceCode, appKey, secretKey string) (
 	c := rest.NewClient(fshttp.NewClient(ctx))
 	opts := &rest.Opts{
 		Method:  "GET",
-		RootURL: openApiUrl,
+		RootURL: openAPIURL,
 		Path:    uriOauthToken,
 		Parameters: map[string][]string{
 			"grant_type":    {"device_token"},
@@ -134,7 +135,7 @@ func authCode(ctx context.Context, appKey string) (*AuthCodeOut, error) {
 	c := rest.NewClient(fshttp.NewClient(ctx))
 	opts := &rest.Opts{
 		Method:  "GET",
-		RootURL: openApiUrl,
+		RootURL: openAPIURL,
 		Path:    uriOauthCode,
 		Parameters: map[string][]string{
 			"response_type": {"device_code"},
@@ -188,7 +189,10 @@ func (f *Fs) reWriteConfig() {
 		}
 		trigger := time.After(sub)
 		<-trigger
-		f.refreshToken()
+		err = f.refreshToken()
+		if err != nil {
+			fs.Errorf(f, "Failed to refresh token: %v", err)
+		}
 	}
 }
 
@@ -214,7 +218,10 @@ func (f *Fs) call(ctx context.Context, opts *rest.Opts, response interface{}) er
 
 	respError := ErrorOut{}
 	b, _ := io.ReadAll(resp.Body)
-	json.Unmarshal(b, &respError)
+	err = json.Unmarshal(b, &respError)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal error response: %w", err)
+	}
 	if respError.Errno != 0 {
 		if respError.Errno == 111 || respError.Errno == -6 {
 			err = f.refreshToken()
@@ -225,7 +232,10 @@ func (f *Fs) call(ctx context.Context, opts *rest.Opts, response interface{}) er
 		}
 		return fmt.Errorf("errno: %d,errmsg: %s", respError.Errno, respError.ErrMsg)
 	}
-	json.Unmarshal(b, response)
+	err = json.Unmarshal(b, response)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal response: %w", err)
+	}
 	return nil
 }
 
@@ -239,7 +249,7 @@ func (f *Fs) download(ctx context.Context, opts *rest.Opts) (resp *http.Response
 func (f *Fs) refreshToken() error {
 	opts := &rest.Opts{
 		Method:  "GET",
-		RootURL: openApiUrl,
+		RootURL: openAPIURL,
 		Path:    uriOauthToken,
 		Parameters: map[string][]string{
 			"grant_type":    {"refresh_token"},
@@ -348,7 +358,7 @@ func (f *Fs) listDirAllFile(ctx context.Context, dir string) ([]FileEntity, erro
 func (f *Fs) listDirFile(ctx context.Context, dir string, start, limit int) ([]FileEntity, error) {
 	opts := &rest.Opts{
 		Method:  "GET",
-		RootURL: rootUrl,
+		RootURL: rootURL,
 		Path:    uriFile,
 		Parameters: map[string][]string{
 			"method":       {"list"},
@@ -428,7 +438,7 @@ func (f *Fs) newObject(path string, size int64) *Object {
 func (f *Fs) fileManager(ctx context.Context, opera, fileList string) error {
 	opts := &rest.Opts{
 		Method:  "POST",
-		RootURL: rootUrl,
+		RootURL: rootURL,
 		Path:    uriFile,
 		Parameters: map[string][]string{
 			"method": {"filemanager"},
@@ -524,7 +534,7 @@ func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time,
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	opts := &rest.Opts{
 		Method:  "POST",
-		RootURL: rootUrl,
+		RootURL: rootURL,
 		Path:    uriFile,
 		Parameters: map[string][]string{
 			"method": {"create"},
@@ -572,7 +582,7 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	opts := &rest.Opts{
 		Method:     "GET",
-		RootURL:    rootUrl,
+		RootURL:    rootURL,
 		Path:       uriQuota,
 		Parameters: map[string][]string{},
 	}
@@ -646,18 +656,18 @@ func (o *Object) Storable() bool {
 
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
-	downloadUrl, err := o.fileDownloadUrl(ctx)
+	downloadURL, err := o.fileDownloadUrl(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return o.download(ctx, downloadUrl, options...)
+	return o.download(ctx, downloadURL, options...)
 }
 
-func (o *Object) download(ctx context.Context, downloadUrl string, options ...fs.OpenOption) (in io.ReadCloser, err error) {
+func (o *Object) download(ctx context.Context, downloadURL string, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	fs.FixRangeOption(options, o.size)
 	opts := rest.Opts{
 		Method:     "GET",
-		RootURL:    downloadUrl + "&access_token=" + o.fs.opt.AccessToken,
+		RootURL:    downloadURL + "&access_token=" + o.fs.opt.AccessToken,
 		Parameters: map[string][]string{},
 		//Options: options,
 	}
@@ -671,7 +681,7 @@ func (o *Object) download(ctx context.Context, downloadUrl string, options ...fs
 func (o *Object) fileDownloadUrl(ctx context.Context) (string, error) {
 	opts := &rest.Opts{
 		Method:  "POST",
-		RootURL: rootUrl,
+		RootURL: rootURL,
 		Path:    uriMultimedia,
 		Parameters: map[string][]string{
 			"method": {"filemetas"},
@@ -761,7 +771,12 @@ func (o *Object) computeLocalHashes(lpath string) (contentMD5, sliceMD5 string, 
 	if err != nil {
 		return "", "", 0, err
 	}
-	defer f.Close()
+	defer func() {
+		closeErr := f.Close()
+		if err == nil {
+			err = closeErr
+		}
+	}()
 
 	hMD5 := md5.New()
 	hCRC32 := crc32.NewIEEE()
@@ -791,7 +806,7 @@ func (o *Object) computeLocalHashes(lpath string) (contentMD5, sliceMD5 string, 
 func (o *Object) rapidUpload(ctx context.Context, remote, contentMD5, sliceMD5, crc32Val string, size int64) error {
 	opts := &rest.Opts{
 		Method:  "POST",
-		RootURL: uploadUrl,
+		RootURL: uploadURL,
 		Path:    uriPCSFile,
 		Parameters: map[string][]string{
 			"method":         {"rapidupload"},
@@ -817,7 +832,7 @@ func (o *Object) sliceUpload(ctx context.Context, remote string, in io.Reader, s
 	contentLength := size + overhead
 	opts := &rest.Opts{
 		Method:        "POST",
-		RootURL:       uploadUrl,
+		RootURL:       uploadURL,
 		Path:          uriSuperFile,
 		ContentType:   contentType,
 		ContentLength: &contentLength,
@@ -837,7 +852,7 @@ func (o *Object) sliceUpload(ctx context.Context, remote string, in io.Reader, s
 func (o *Object) complete(ctx context.Context, remote, md5ListJson string) (FileEntity, error) {
 	opts := &rest.Opts{
 		Method:  "POST",
-		RootURL: uploadUrl,
+		RootURL: uploadURL,
 		Path:    uriPCSFile,
 		Parameters: map[string][]string{
 			"method": {"createsuperfile"},
