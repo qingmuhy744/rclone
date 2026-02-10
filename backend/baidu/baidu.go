@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"os"
@@ -38,11 +39,13 @@ const (
 	uriOauthToken = "/oauth/2.0/token"
 	uriFile       = "/rest/2.0/xpan/file"
 	uriSuperFile  = "/rest/2.0/pcs/superfile2"
+	uriPCSFile    = "/rest/2.0/pcs/file"
 	uriMultimedia = "/rest/2.0/xpan/multimedia"
 	uriQuota      = "/api/quota"
 
 	//
-	chunkSize = 4 * 1024 * 1024 //分片大小4M
+	chunkSize         = 4 * 1024 * 1024 //分片大小4M
+	rapidUploadThreshold = 256 * 1024    //秒传阈值256KB
 )
 
 // Options defines the configuration for this backend
@@ -696,100 +699,120 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	return o.upload(ctx, in, src.Size())
 }
 
-func fileMd5(file *os.File) string {
-	file.Seek(0, 0)
-	hash := md5.New()
-	io.Copy(hash, file)
-	return hex.EncodeToString(hash.Sum(nil))
-}
-
 func (o *Object) upload(ctx context.Context, in io.Reader, size int64) error {
-	var md5s []string
-	var files []*os.File
+	remote := "/" + strings.TrimLeft(o.remote, "/")
 
-	defer func() {
-		for _, f := range files {
-			if f != nil {
-				os.Remove(f.Name())
-				f.Close()
+	// 1. 尝试秒传 (仅针对已知大小且较大的文件尝试)
+	if size > rapidUploadThreshold {
+		// 这里尝试从 reader 获取底层文件以计算秒传所需的哈希
+		// NOTE: 这种方式不一定总是成功，取决于 rclone 如何传递流
+		if f, ok := in.(*os.File); ok {
+			contentMD5, sliceMD5, crc32Val, err := o.computeLocalHashes(f.Name())
+			if err == nil {
+				err = o.rapidUpload(ctx, remote, contentMD5, sliceMD5, fmt.Sprintf("%x", crc32Val), size)
+				if err == nil {
+					return nil // 秒传成功
+				}
+				fs.Debugf(o, "秒传失败: %v，转为普通上传", err)
 			}
 		}
-	}()
+	}
+
+	// 2. 流式切片上传 (方案 A)
+	var md5s []string
+	buf := make([]byte, chunkSize)
+	var uploaded int64 = 0
 
 	for {
-		tFile, err := os.CreateTemp("", "rclone_baidu_")
-		if err != nil {
-			return err
-		}
-		n, err := io.CopyN(tFile, in, chunkSize)
-		if err != nil && n == 0 {
-			os.Remove(tFile.Name())
-			tFile.Close()
-			if err == io.EOF {
-				break
+		n, err := io.ReadFull(in, buf)
+		if n > 0 {
+			md5sum, uploadErr := o.sliceUpload(ctx, remote, bytes.NewReader(buf[:n]), int64(n))
+			if uploadErr != nil {
+				return fmt.Errorf("分片上传失败: %w", uploadErr)
 			}
+			md5s = append(md5s, md5sum)
+			uploaded += int64(n)
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		if err != nil {
 			return err
 		}
-		md5s = append(md5s, fileMd5(tFile))
-		files = append(files, tFile)
 	}
+
+	if len(md5s) == 0 && size > 0 {
+		return errors.New("没有读取到任何数据")
+	}
+
+	// 3. 合并文件
 	md5ListBytes, _ := json.Marshal(md5s)
-
-	out, err := o.preUpload(ctx, string(md5ListBytes), o.remote, size)
+	file, err := o.complete(ctx, remote, string(md5ListBytes))
 	if err != nil {
-		return err
-	}
-
-	if len(out.BlockList) != len(files) {
-		return errors.New("file chunk size is error")
-	}
-
-	for k, file := range files {
-		info, err := file.Stat()
-		if err != nil {
-			return err
-		}
-		err = o.sliceUpload(ctx, o.remote, out.UploadId, k, file, info.Size())
-		if err != nil {
-			return err
-		}
-		os.Remove(file.Name())
-		file.Close()
-	}
-	file, err := o.complete(ctx, o.remote, string(md5ListBytes), out.UploadId, size)
-	if err != nil {
-		return err
+		return fmt.Errorf("合并文件失败: %w", err)
 	}
 	o.id = strconv.FormatUint(file.FsId, 10)
 	o.path = file.Path
 	return nil
 }
 
-// 预上传
-func (o *Object) preUpload(ctx context.Context, md5ListJson string, remote string, size int64) (PreUploadOut, error) {
+func (o *Object) computeLocalHashes(lpath string) (contentMD5, sliceMD5 string, crc32Val uint32, err error) {
+	f, err := os.Open(lpath)
+	if err != nil {
+		return "", "", 0, err
+	}
+	defer f.Close()
+
+	hMD5 := md5.New()
+	hCRC32 := crc32.NewIEEE()
+	hSliceMD5 := md5.New()
+
+	mw := io.MultiWriter(hMD5, hCRC32)
+
+	// 读取前 256KB 算 Slice-MD5
+	limitReader := io.LimitReader(f, rapidUploadThreshold)
+	teeReader := io.TeeReader(limitReader, hSliceMD5)
+
+	_, err = io.Copy(mw, teeReader)
+	if err != nil {
+		return "", "", 0, err
+	}
+
+	// 读取剩余部分
+	_, err = io.Copy(mw, f)
+	if err != nil {
+		return "", "", 0, err
+	}
+
+	return hex.EncodeToString(hMD5.Sum(nil)), hex.EncodeToString(hSliceMD5.Sum(nil)), hCRC32.Sum32(), nil
+}
+
+// 秒传
+func (o *Object) rapidUpload(ctx context.Context, remote, contentMD5, sliceMD5, crc32Val string, size int64) error {
 	opts := &rest.Opts{
 		Method:  "POST",
-		RootURL: rootUrl,
-		Path:    uriFile,
+		RootURL: uploadUrl,
+		Path:    uriPCSFile,
 		Parameters: map[string][]string{
-			"method": {"precreate"},
+			"method":       {"rapidupload"},
+			"path":         {remote},
+			"content-length": {strconv.FormatInt(size, 10)},
+			"content-md5":    {contentMD5},
+			"slice-md5":      {sliceMD5},
+			"content-crc32":  {crc32Val},
+			"ondup":          {"overwrite"},
 		},
-		Body: bytes.NewBuffer([]byte(fmt.Sprintf("path=%s&size=%d&rtype=0&isdir=0&autoinit=1&block_list=%s", "/"+strings.TrimLeft(remote, "/"), size, md5ListJson))),
 	}
-	resp := PreUploadOut{}
+	resp := RapidUploadOut{}
 	err := o.fs.call(ctx, opts, &resp)
-	return resp, err
+	return err
 }
 
 // 分片上传
-func (o *Object) sliceUpload(ctx context.Context, remote, uploadId string, partSeq int, file *os.File, size int64) (err error) {
-	if file == nil {
-		return errors.New("file error")
-	}
-	file.Seek(0, 0)
-	formReader, contentType, overhead, err := rest.MultipartUpload(ctx, file, nil, "file", "file")
+func (o *Object) sliceUpload(ctx context.Context, remote string, in io.Reader, size int64) (md5sum string, err error) {
+	formReader, contentType, overhead, err := rest.MultipartUpload(ctx, in, nil, "file", "file", "")
 	if err != nil {
-		return fmt.Errorf("failed to make multipart upload for 0 length file: %w", err)
+		return "", err
 	}
 	contentLength := size + overhead
 	opts := &rest.Opts{
@@ -799,28 +822,29 @@ func (o *Object) sliceUpload(ctx context.Context, remote, uploadId string, partS
 		ContentType:   contentType,
 		ContentLength: &contentLength,
 		Parameters: map[string][]string{
-			"method":   {"upload"},
-			"type":     {"tmpfile"},
-			"path":     {"/" + strings.TrimLeft(remote, "/")},
-			"uploadid": {uploadId},
-			"partseq":  {strconv.Itoa(partSeq)},
+			"method": {"upload"},
+			"type":   {"tmpfile"},
+			"path":   {remote},
 		},
 		Body: formReader,
 	}
 	resp := SliceUploadOut{}
-	return o.fs.call(ctx, opts, &resp)
+	err = o.fs.call(ctx, opts, &resp)
+	return resp.Md5, err
 }
 
-// 完成上传
-func (o *Object) complete(ctx context.Context, remote, md5ListJson, uploadId string, size int64) (FileEntity, error) {
+// 合并上传 (createsuperfile)
+func (o *Object) complete(ctx context.Context, remote, md5ListJson string) (FileEntity, error) {
 	opts := &rest.Opts{
 		Method:  "POST",
-		RootURL: rootUrl,
-		Path:    uriFile,
+		RootURL: uploadUrl,
+		Path:    uriPCSFile,
 		Parameters: map[string][]string{
-			"method": {"create"},
+			"method": {"createsuperfile"},
+			"path":   {remote},
+			"ondup":  {"overwrite"},
 		},
-		Body: bytes.NewBuffer([]byte(fmt.Sprintf("path=%s&size=%d&rtype=0&isdir=0&autoinit=1&block_list=%s&uploadid=%s", "/"+strings.TrimLeft(remote, "/"), size, md5ListJson, uploadId))),
+		Body: bytes.NewBuffer([]byte(fmt.Sprintf("param=%s", `{"block_list":`+md5ListJson+`}`))),
 	}
 	resp := FileEntity{}
 	err := o.fs.call(ctx, opts, &resp)
