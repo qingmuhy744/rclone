@@ -43,8 +43,10 @@ type FileListOut struct {
 
 // ErrorOut is the common error response from Baidu
 type ErrorOut struct {
-	Errno  int    `json:"errno"`
-	ErrMsg string `json:"errmsg"`
+	Errno     int    `json:"errno"`
+	ErrMsg    string `json:"errmsg"`
+	ErrorCode int    `json:"error_code"`
+	ErrorMsg  string `json:"error_msg"`
 }
 
 // MkdirOut is the response for mkdir request
@@ -110,7 +112,14 @@ type FileInfoListOut struct {
 	List []DownloadURL `json:"list"`
 }
 
-// DownloadURL represents a download address
+// DownloadURL represents a download address with file metadata
 type DownloadURL struct {
+	FileEntity
 	Dlink string `json:"dlink"`
+}
+
+// SimpleUploadOut is the response for simple upload (single part)
+type SimpleUploadOut struct {
+	ErrorOut
+	FileEntity
 }

@@ -12,13 +12,12 @@ import (
 	"hash/crc32"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/rclone/rclone/lib/dircache"
 
 	"github.com/rclone/rclone/fs/config/configstruct"
 
@@ -32,7 +31,7 @@ import (
 const (
 	openAPIURL = "https://openapi.baidu.com"
 	rootURL    = "https://pan.baidu.com"
-	uploadURL  = "https://d.pcs.baidu.com"
+	uploadURL  = "https://c.pcs.baidu.com"
 	rootID     = "/"
 
 	//uri
@@ -164,7 +163,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		ci:          ci,
 		srv:         rest.NewClient(fshttp.NewClient(ctx)),
 		downloadSrv: rest.NewClient(fshttp.NewClient(ctx)),
-		root:        root,
+		root:        "/" + strings.Trim(root, "/"),
 		ctx:         ctx,
 		opt:         opt,
 		m:           m,
@@ -212,6 +211,11 @@ type Fs struct {
 func (f *Fs) call(ctx context.Context, opts *rest.Opts, response interface{}) error {
 	//设置AccessToken
 	opts.Parameters.Set("access_token", f.opt.AccessToken)
+	if opts.ExtraHeaders == nil {
+		opts.ExtraHeaders = make(map[string]string)
+	}
+	// 伪装为百度云管家，提高兼容性
+	opts.ExtraHeaders["User-Agent"] = "netdisk;P2SP;8.3.1.2;PC;PC-Windows;10.0.19042;WindowsBaiduYunGuanJia"
 	resp, err := f.srv.Call(ctx, opts)
 	if err != nil {
 		return err
@@ -223,21 +227,32 @@ func (f *Fs) call(ctx context.Context, opts *rest.Opts, response interface{}) er
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal error response: %w", err)
 	}
-	if respError.Errno != 0 {
-		if respError.Errno == 111 || respError.Errno == -6 {
+	// 同时检查 errno 和 error_code
+	if respError.Errno != 0 || respError.ErrorCode != 0 {
+		errno := respError.Errno
+		errmsg := respError.ErrMsg
+		if respError.ErrorCode != 0 {
+			errno = respError.ErrorCode
+			errmsg = respError.ErrorMsg
+		}
+		if errno == 111 || errno == -6 || errno == 110 {
 			err = f.refreshToken()
 			if err != nil {
 				return err
 			}
 			return f.call(ctx, opts, response)
 		}
-		return fmt.Errorf("errno: %d,errmsg: %s", respError.Errno, respError.ErrMsg)
+		return fmt.Errorf("errno: %d,errmsg: %s", errno, errmsg)
 	}
 	err = json.Unmarshal(b, response)
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 	return nil
+}
+
+func (f *Fs) fullPath(remote string) string {
+	return "/" + strings.TrimLeft(path.Join(f.root, remote), "/")
 }
 
 func (f *Fs) download(ctx context.Context, opts *rest.Opts) (resp *http.Response, err error) {
@@ -315,19 +330,24 @@ func (f *Fs) Hashes() hash.Set {
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	list, err := f.listDirAllFile(ctx, "/"+strings.TrimLeft(dir, "/"))
+	list, err := f.listDirAllFile(ctx, f.fullPath(dir))
 	if err != nil {
 		return nil, err
 	}
 
 	for _, info := range list {
+		remote := strings.TrimLeft(strings.TrimPrefix(info.Path, f.root), "/")
+		if remote == "" {
+			continue
+		}
+
 		var item fs.DirEntry
 		if info.IsDir == 1 {
-			item = fs.NewDir(strings.TrimLeft(info.Path, "/"), time.Unix(info.ServerMtime, 0)).SetID(strconv.FormatUint(info.FsID, 10))
+			item = fs.NewDir(remote, time.Unix(info.ServerMtime, 0)).SetID(strconv.FormatUint(info.FsID, 10))
 		} else {
 			item = &Object{
 				fs:      f,
-				remote:  strings.TrimLeft(info.Path, "/"),
+				remote:  remote,
 				path:    info.Path,
 				size:    info.Size,
 				id:      strconv.FormatUint(info.FsID, 10),
@@ -375,6 +395,9 @@ func (f *Fs) listDirFile(ctx context.Context, dir string, start, limit int) ([]F
 	resp := &FileListOut{}
 	err := f.call(ctx, opts, resp)
 	if err != nil {
+		if strings.Contains(err.Error(), "errno: -9") {
+			return nil, nil // 路径不存在或不是目录，返回空列表
+		}
 		return nil, err
 	}
 	return resp.List, nil
@@ -423,7 +446,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fs.ErrorCantCopy
 	}
 	p, name := path.Split(remote)
-	fileList := fmt.Sprintf(`[{"path":"%s","dest":"%s","newname":"%s","ondup":"newcopy"}]`, srcObj.path, p, name)
+	fileList := fmt.Sprintf(`[{"path":"%s","dest":"%s","newname":"%s","ondup":"newcopy"}]`, srcObj.path, f.fullPath(p), name)
 	err := f.fileManager(ctx, "copy", fileList)
 	if err != nil {
 		return nil, err
@@ -469,7 +492,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fs.ErrorCantMove
 	}
 	p, name := path.Split(remote)
-	fileList := fmt.Sprintf(`[{"path":"%s","dest":"%s","newname":"%s","ondup":"newcopy"}]`, srcObj.path, p, name)
+	fileList := fmt.Sprintf(`[{"path":"%s","dest":"%s","newname":"%s","ondup":"newcopy"}]`, srcObj.path, f.fullPath(p), name)
 	err := f.fileManager(ctx, "move", fileList)
 	if err != nil {
 		return nil, err
@@ -533,6 +556,11 @@ func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time,
 //
 // Shouldn't return an error if it already exists
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	v := url.Values{}
+	v.Set("path", f.fullPath(dir))
+	v.Set("isdir", "1")
+	v.Set("rtype", "0")
+
 	opts := &rest.Opts{
 		Method:  "POST",
 		RootURL: rootURL,
@@ -540,28 +568,33 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 		Parameters: map[string][]string{
 			"method": {"create"},
 		},
-		Body: bytes.NewBuffer([]byte(fmt.Sprintf("path=%s&isdir=1&rtype=0", "/"+strings.TrimLeft(dir, "/")))),
+		Body:        strings.NewReader(v.Encode()),
+		ContentType: "application/x-www-form-urlencoded",
 	}
 	resp := MkdirOut{}
-	return f.call(ctx, opts, resp)
+	err := f.call(ctx, opts, &resp)
+	if err != nil && strings.Contains(err.Error(), "errno: -9") {
+		return nil
+	}
+	return err
 }
 
 // Rmdir removes the directory (container, bucket) if empty
 //
 // Return an error if it doesn't exist or isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	dir = "/" + strings.TrimLeft(dir, "/")
-	if dir == "/" {
+	fullDir := f.fullPath(dir)
+	if fullDir == "/" {
 		return errors.New("the root directory cannot be deleted")
 	}
-	list, err := f.listDirFile(ctx, dir, 0, 1)
+	list, err := f.listDirFile(ctx, fullDir, 0, 1)
 	if err != nil {
 		return err
 	}
 	if len(list) != 0 {
 		return errors.New("directory is not be empty")
 	}
-	fileList := fmt.Sprintf(`[{"path":"%s"}]`, dir)
+	fileList := fmt.Sprintf(`[{"path":"%s"}]`, f.fullPath(dir))
 	return f.fileManager(ctx, "delete", fileList)
 }
 
@@ -712,38 +745,43 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 }
 
 func (o *Object) upload(ctx context.Context, in io.Reader, size int64) error {
-	remote := "/" + strings.TrimLeft(o.remote, "/")
+	remote := o.fs.fullPath(o.remote)
 
-	// 1. 尝试秒传 (仅针对已知大小且较大的文件尝试)
+	// 1. 尝试秒传
 	if size > rapidUploadThreshold {
-		// 这里尝试从 reader 获取底层文件以计算秒传所需的哈希
-		// NOTE: 这种方式不一定总是成功，取决于 rclone 如何传递流
 		if f, ok := in.(*os.File); ok {
 			contentMD5, sliceMD5, crc32Val, err := o.computeLocalHashes(f.Name())
 			if err == nil {
-				err = o.rapidUpload(ctx, remote, contentMD5, sliceMD5, fmt.Sprintf("%x", crc32Val), size)
+				err = o.rapidUpload(ctx, remote, contentMD5, sliceMD5, crc32Val, size)
 				if err == nil {
 					return nil // 秒传成功
 				}
-				fs.Debugf(o, "秒传失败: %v，转为普通上传", err)
+				fs.Debugf(o, "秒传失败: %v，转普通上传", err)
 			}
 		}
 	}
 
-	// 2. 流式切片上传 (方案 A)
+	// 2. 对于 2GB 以下文件，使用单次上传 (Simple Upload) 绕过分片上传 Bug (31064)
+	if size <= 2*1024*1024*1024 {
+		return o.simpleUpload(ctx, in, size)
+	}
+
+	// 3. 超过 2GB 或流式大数据量时，使用 XPAN 三阶段分片上传
+	// 注意：分片上传目前在部分账户/应用下可能报 31064 错误
 	var md5s []string
+	var chunks [][]byte
 	buf := make([]byte, chunkSize)
-	var uploaded int64
 
 	for {
 		n, err := io.ReadFull(in, buf)
 		if n > 0 {
-			md5sum, uploadErr := o.sliceUpload(ctx, remote, bytes.NewReader(buf[:n]), int64(n))
-			if uploadErr != nil {
-				return fmt.Errorf("分片上传失败: %w", uploadErr)
-			}
-			md5s = append(md5s, md5sum)
-			uploaded += int64(n)
+			chunkCopy := make([]byte, n)
+			copy(chunkCopy, buf[:n])
+			chunks = append(chunks, chunkCopy)
+
+			h := md5.New()
+			h.Write(chunkCopy)
+			md5s = append(md5s, hex.EncodeToString(h.Sum(nil)))
 		}
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			break
@@ -753,19 +791,55 @@ func (o *Object) upload(ctx context.Context, in io.Reader, size int64) error {
 		}
 	}
 
-	if len(md5s) == 0 && size > 0 {
-		return errors.New("没有读取到任何数据")
+	// 预上传 (Precreate)
+	preResp, err := o.precreate(ctx, remote, size, md5s)
+	if err != nil {
+		return fmt.Errorf("precreate 失败: %w", err)
+	}
+	uploadID := preResp.UploadID
+
+	// 分片上传 (SliceUpload)
+	for i, chunkData := range chunks {
+		_, err := o.sliceUpload(ctx, remote, uploadID, i, bytes.NewReader(chunkData), int64(len(chunkData)))
+		if err != nil {
+			return fmt.Errorf("分片 %d 上传失败: %w", i, err)
+		}
 	}
 
-	// 3. 合并文件
+	// 调用 Create 提交
 	md5ListBytes, _ := json.Marshal(md5s)
-	file, err := o.complete(ctx, remote, string(md5ListBytes))
+	file, err := o.complete(ctx, remote, uploadID, size, string(md5ListBytes))
 	if err != nil {
 		return fmt.Errorf("合并文件失败: %w", err)
 	}
 	o.id = strconv.FormatUint(file.FsID, 10)
 	o.path = file.Path
 	return nil
+}
+
+func (o *Object) precreate(ctx context.Context, remote string, size int64, md5s []string) (*PreUploadOut, error) {
+	md5ListJSON, _ := json.Marshal(md5s)
+	v := url.Values{}
+	v.Set("path", remote)
+	v.Set("size", strconv.FormatInt(size, 10))
+	v.Set("isdir", "0")
+	v.Set("autoinit", "1")
+	v.Set("rtype", "3")
+	v.Set("block_list", string(md5ListJSON))
+
+	opts := &rest.Opts{
+		Method:  "POST",
+		RootURL: rootURL,
+		Path:    uriFile,
+		Parameters: map[string][]string{
+			"method": {"precreate"},
+		},
+		Body:        strings.NewReader(v.Encode()),
+		ContentType: "application/x-www-form-urlencoded",
+	}
+	resp := &PreUploadOut{}
+	err := o.fs.call(ctx, opts, resp)
+	return resp, err
 }
 
 func (o *Object) computeLocalHashes(lpath string) (contentMD5, sliceMD5 string, crc32Val uint32, err error) {
@@ -805,7 +879,7 @@ func (o *Object) computeLocalHashes(lpath string) (contentMD5, sliceMD5 string, 
 }
 
 // 秒传
-func (o *Object) rapidUpload(ctx context.Context, remote, contentMD5, sliceMD5, crc32Val string, size int64) error {
+func (o *Object) rapidUpload(ctx context.Context, remote, contentMD5, sliceMD5 string, crc32Val uint32, size int64) error {
 	opts := &rest.Opts{
 		Method:  "POST",
 		RootURL: uploadURL,
@@ -816,7 +890,7 @@ func (o *Object) rapidUpload(ctx context.Context, remote, contentMD5, sliceMD5, 
 			"content-length": {strconv.FormatInt(size, 10)},
 			"content-md5":    {contentMD5},
 			"slice-md5":      {sliceMD5},
-			"content-crc32":  {crc32Val},
+			"content-crc32":  {fmt.Sprintf("%d", crc32Val)},
 			"ondup":          {"overwrite"},
 		},
 	}
@@ -825,8 +899,42 @@ func (o *Object) rapidUpload(ctx context.Context, remote, contentMD5, sliceMD5, 
 	return err
 }
 
+// 单次上传 (Simple Upload)
+func (o *Object) simpleUpload(ctx context.Context, in io.Reader, size int64) error {
+	remote := o.fs.fullPath(o.remote)
+	formReader, contentType, overhead, err := rest.MultipartUpload(ctx, in, nil, "file", "file", "")
+	if err != nil {
+		return err
+	}
+	contentLength := size + overhead
+	opts := &rest.Opts{
+		Method:        "POST",
+		RootURL:       uploadURL,
+		Path:          uriPCSFile,
+		ContentType:   contentType,
+		ContentLength: &contentLength,
+		ExtraHeaders: map[string]string{
+			"User-Agent": "netdisk;P2SP;8.3.1.2;PC;PC-Windows;10.0.19042;WindowsBaiduYunGuanJia",
+		},
+		Parameters: map[string][]string{
+			"method": {"upload"},
+			"path":   {remote},
+			"ondup":  {"overwrite"},
+		},
+		Body: formReader,
+	}
+	resp := SimpleUploadOut{}
+	err = o.fs.call(ctx, opts, &resp)
+	if err != nil {
+		return err
+	}
+	o.id = strconv.FormatUint(resp.FsID, 10)
+	o.path = resp.Path
+	return nil
+}
+
 // 分片上传
-func (o *Object) sliceUpload(ctx context.Context, remote string, in io.Reader, size int64) (md5sum string, err error) {
+func (o *Object) sliceUpload(ctx context.Context, remote, uploadID string, partSeq int, in io.Reader, size int64) (md5sum string, err error) {
 	formReader, contentType, overhead, err := rest.MultipartUpload(ctx, in, nil, "file", "file", "")
 	if err != nil {
 		return "", err
@@ -835,37 +943,57 @@ func (o *Object) sliceUpload(ctx context.Context, remote string, in io.Reader, s
 	opts := &rest.Opts{
 		Method:        "POST",
 		RootURL:       uploadURL,
-		Path:          uriSuperFile,
+		Path:          uriPCSFile,
 		ContentType:   contentType,
 		ContentLength: &contentLength,
+		ExtraHeaders: map[string]string{
+			"User-Agent": "netdisk;P2SP;8.3.1.2;PC;PC-Windows;10.0.19042;WindowsBaiduYunGuanJia",
+		},
 		Parameters: map[string][]string{
-			"method": {"upload"},
-			"type":   {"tmpfile"},
-			"path":   {remote},
+			"method":   {"upload"},
+			"type":     {"tmpfile"},
+			"path":     {remote},
+			"uploadid": {uploadID},
+			"partseq":  {strconv.Itoa(partSeq)},
 		},
 		Body: formReader,
 	}
+
 	resp := SliceUploadOut{}
 	err = o.fs.call(ctx, opts, &resp)
 	return resp.Md5, err
 }
 
-// 合并上传 (createsuperfile)
-func (o *Object) complete(ctx context.Context, remote, md5ListJSON string) (FileEntity, error) {
+// 合并上传 (create)
+func (o *Object) complete(ctx context.Context, remote, uploadID string, size int64, md5ListJSON string) (FileEntity, error) {
+	v := url.Values{}
+	v.Set("path", remote)
+	v.Set("size", strconv.FormatInt(size, 10))
+	v.Set("isdir", "0")
+	v.Set("rtype", "3")
+	v.Set("uploadid", uploadID)
+	// block_list 需要是 ["...", "..."] 的 JSON 数组格式
+	v.Set("block_list", md5ListJSON)
+
 	opts := &rest.Opts{
 		Method:  "POST",
-		RootURL: uploadURL,
-		Path:    uriPCSFile,
+		RootURL: rootURL,
+		Path:    uriFile,
 		Parameters: map[string][]string{
-			"method": {"createsuperfile"},
-			"path":   {remote},
-			"ondup":  {"overwrite"},
+			"method": {"create"},
 		},
-		Body: bytes.NewBuffer([]byte(fmt.Sprintf("param=%s", `{"block_list":`+md5ListJSON+`}`))),
+		Body:        strings.NewReader(v.Encode()),
+		ContentType: "application/x-www-form-urlencoded",
 	}
-	resp := FileEntity{}
+	resp := MkdirOut{} // create 返回的结构与 mkdir 类似
 	err := o.fs.call(ctx, opts, &resp)
-	return resp, err
+	if err != nil {
+		return FileEntity{}, err
+	}
+	return FileEntity{
+		FsID: resp.FsID,
+		Path: resp.Path,
+	}, nil
 }
 
 // Remove an object
@@ -898,19 +1026,18 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 		return nil
 	}
 
-	list, err := o.fs.listDirAllFile(ctx, o.remote)
+	// XPAN 无法通过 path 直接获取 filemeta (errno: 2)，必须通过父目录 List 查找
+	dir, leaf := path.Split(o.fs.fullPath(o.remote))
+	list, err := o.fs.listDirAllFile(ctx, dir)
 	if err != nil {
 		return err
 	}
 
-	_, leaf := dircache.SplitPath(o.remote)
-
-	var info FileEntity
 	for _, v := range list {
 		if v.IsDir == 0 && strings.EqualFold(v.ServerFilename, leaf) {
-			info = v
-			break
+			return o.setMetaData(&v)
 		}
 	}
-	return o.setMetaData(&info)
+
+	return fs.ErrorObjectNotFound
 }
