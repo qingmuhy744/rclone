@@ -1,14 +1,16 @@
 package baidu
 
+// AuthCodeOut is the response for device code request
 type AuthCodeOut struct {
 	DeviceCode      string `json:"device_code"`      //设备码，可用于生成单次凭证 Access Token。
 	UserCode        string `json:"user_code"`        //用户码。 如果选择让用户输入 user code 方式，来引导用户授权，设备需要展示 user code 给用户。
-	VerificationUrl string `json:"verification_url"` //	用户输入 user code 进行授权的 url。
-	QrcodeUrl       string `json:"qrcode_url"`       //二维码url，用户用手机等智能终端扫描该二维码完成授权。
+	VerificationURL string `json:"verification_url"` //	用户输入 user code 进行授权的 url。
+	QrcodeURL       string `json:"qrcode_url"`       //二维码url，用户用手机等智能终端扫描该二维码完成授权。
 	ExpiresIn       int    `json:"expires_in"`       //device_code 的过期时间，单位：秒。到期后 device_code 不能换 Access Token。
 	Interval        int    `json:"interval"`         //device_code 换 Access Token 轮询间隔时间，单位：秒。轮询次数限制小于 expire_in/interval。
 }
 
+// AccessTokenOut is the response for access token request
 type AccessTokenOut struct {
 	ExpiresIn     int    `json:"expires_in"`
 	RefreshToken  string `json:"refresh_token"`
@@ -18,8 +20,9 @@ type AccessTokenOut struct {
 	Scope         string `json:"scope"`
 }
 
+// FileEntity represents a single file or directory in Baidu
 type FileEntity struct {
-	FsId           uint64 `json:"fs_id"`           //文件在云端的唯一标识ID
+	FsID           uint64 `json:"fs_id"`           //文件在云端的唯一标识ID
 	Path           string `json:"path"`            //文件的绝对路径
 	ServerFilename string `json:"server_filename"` //文件名称
 	Size           int64  `json:"size"`            //文件大小，单位B
@@ -32,27 +35,31 @@ type FileEntity struct {
 	DirEmpty       int    `json:"dir_empty"`       //该目录是否存在子目录，只有请求参数web=1且该条目为目录时，该字段才存在， 0为存在， 1为不存在
 }
 
+// FileListOut is the response for file list request
 type FileListOut struct {
 	ErrorOut
 	List []FileEntity `json:"list"`
 }
 
+// ErrorOut is the common error response from Baidu
 type ErrorOut struct {
 	Errno  int    `json:"errno"`
 	ErrMsg string `json:"errmsg"`
 }
 
+// MkdirOut is the response for mkdir request
 type MkdirOut struct {
 	ErrorOut
 	Ctime    uint   `json:"ctime"`
 	Mtime    uint   `json:"mtime"`
-	FsId     uint64 `json:"fs_id"`
+	FsID     uint64 `json:"fs_id"`
 	IsDir    uint   `json:"is_dir"`
 	Path     string `json:"path"`
 	Status   uint   `json:"status"`
 	Category uint   `json:"category"`
 }
 
+// QuotaOut is the response for quota request
 type QuotaOut struct {
 	Total  int64 `json:"total"`  //总空间大小，单位B
 	Expire bool  `json:"expire"` //7天内是否有容量到期
@@ -60,19 +67,22 @@ type QuotaOut struct {
 	Free   int64 `json:"free"`   //剩余大小，单位B
 }
 
+// PreUploadOut is the response for pre-upload request
 type PreUploadOut struct {
 	ErrorOut
 	Path       string `json:"path"`        //文件的绝对路径
-	UploadId   string `json:"uploadid"`    //上传唯一ID标识此上传任务
+	UploadID   string `json:"uploadid"`    //上传唯一ID标识此上传任务
 	ReturnType int    `json:"return_type"` //返回类型，系统内部状态字段
 	BlockList  []int  `json:"block_list"`  //需要上传的分片序号列表，索引从0开始
 }
 
+// SliceUploadOut is the response for slice upload request
 type SliceUploadOut struct {
 	ErrorOut
 	Md5 string `json:"md5"` //
 }
 
+// RapidUploadOut is the response for rapid upload request
 type RapidUploadOut struct {
 	ErrorOut
 	Info FileEntity `json:"info"`
@@ -94,11 +104,13 @@ list[0] ["width”]	int	图片宽度
 list[0] ["date_taken”]	int	图片拍摄时间
 */
 
+// FileInfoListOut is the response for file info request
 type FileInfoListOut struct {
 	ErrorOut
-	List []DownLoadUrl `json:"list"`
+	List []DownloadURL `json:"list"`
 }
 
-type DownLoadUrl struct {
-	DLink string `json:"dlink"`
+// DownloadURL represents a download address
+type DownloadURL struct {
+	Dlink string `json:"dlink"`
 }

@@ -202,14 +202,24 @@ jobs:
           make compile_all
         if: matrix.compile_all
 
-      - name: Deploy built binaries
+      - name: Build Packages
         run: |
           if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then make release_dep_linux ; fi
+          # Use compile_all or a similar flag to generate local packages
+          VERSION=$(make version)
+          # We only generate packages for linux in the linux job to save time
+          if [[ "${{ matrix.job_name }}" == "linux" ]]; then
+            go run bin/cross-compile.go -include "^linux/amd64$" $VERSION
+          elif [[ "${{ matrix.job_name }}" == "linux_386" ]]; then
+            go run bin/cross-compile.go -include "^linux/386$" $VERSION
+          fi
+        if: matrix.deploy && (matrix.job_name == 'linux' || matrix.job_name == 'linux_386')
+
+      - name: Deploy built binaries
+        run: |
           make ci_beta
         env:
           RCLONE_CONFIG_PASS: ${{ secrets.RCLONE_CONFIG_PASS }}
-        # working-directory: '$(modulePath)'
-        # Deploy binaries if enabled in config && not a PR && not a fork
         if: env.RCLONE_CONFIG_PASS != '' && matrix.deploy && github.head_ref == ''
 
   lint:

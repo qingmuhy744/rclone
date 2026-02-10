@@ -95,7 +95,7 @@ func Config(ctx context.Context, name string, m configmap.Mapper, c fs.ConfigIn)
 		return nil, err
 	}
 
-	fmt.Printf("请在浏览器中打开链接：%s ,并在打开的页面中输入：%s 获取授权。\n", auth.VerificationUrl, auth.UserCode)
+	fmt.Printf("请在浏览器中打开链接：%s ,并在打开的页面中输入：%s 获取授权。\n", auth.VerificationURL, auth.UserCode)
 
 	for {
 		token, err := getAccessToken(ctx, auth.DeviceCode, appKey, secretKey)
@@ -196,6 +196,7 @@ func (f *Fs) reWriteConfig() {
 	}
 }
 
+// Fs represents a remote Baidu server
 type Fs struct {
 	name        string
 	ci          *fs.ConfigInfo
@@ -299,7 +300,7 @@ func (f *Fs) Precision() time.Duration {
 	return time.Second
 }
 
-// Returns the supported hash types of the filesystem
+// Hashes returns the supported hash types of the filesystem
 func (f *Fs) Hashes() hash.Set {
 	return hash.NewHashSet(hash.None)
 }
@@ -322,15 +323,15 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	for _, info := range list {
 		var item fs.DirEntry
 		if info.IsDir == 1 {
-			item = fs.NewDir(strings.TrimLeft(info.Path, "/"), time.Unix(int64(info.ServerMtime), 0)).SetID(strconv.FormatUint(info.FsId, 10))
+			item = fs.NewDir(strings.TrimLeft(info.Path, "/"), time.Unix(info.ServerMtime, 0)).SetID(strconv.FormatUint(info.FsID, 10))
 		} else {
 			item = &Object{
 				fs:      f,
 				remote:  strings.TrimLeft(info.Path, "/"),
 				path:    info.Path,
-				size:    int64(info.Size),
-				id:      strconv.FormatUint(info.FsId, 10),
-				modTime: time.Unix(int64(info.ServerMtime), 0),
+				size:    info.Size,
+				id:      strconv.FormatUint(info.FsID, 10),
+				modTime: time.Unix(info.ServerMtime, 0),
 			}
 		}
 		entries = append(entries, item)
@@ -598,6 +599,7 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	return usage, nil
 }
 
+// Object describes a Baidu file
 type Object struct {
 	fs          *Fs // what this object is part of
 	path        string
@@ -656,7 +658,7 @@ func (o *Object) Storable() bool {
 
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
-	downloadURL, err := o.fileDownloadUrl(ctx)
+	downloadURL, err := o.fileDownloadURL(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -678,7 +680,7 @@ func (o *Object) download(ctx context.Context, downloadURL string, options ...fs
 	return resp.Body, err
 }
 
-func (o *Object) fileDownloadUrl(ctx context.Context) (string, error) {
+func (o *Object) fileDownloadURL(ctx context.Context) (string, error) {
 	opts := &rest.Opts{
 		Method:  "POST",
 		RootURL: rootURL,
@@ -697,7 +699,7 @@ func (o *Object) fileDownloadUrl(ctx context.Context) (string, error) {
 	if len(resp.List) == 0 {
 		return "", errors.New("")
 	}
-	return resp.List[0].DLink, nil
+	return resp.List[0].Dlink, nil
 }
 
 // Update the object with the contents of the io.Reader, modTime and size
@@ -731,7 +733,7 @@ func (o *Object) upload(ctx context.Context, in io.Reader, size int64) error {
 	// 2. 流式切片上传 (方案 A)
 	var md5s []string
 	buf := make([]byte, chunkSize)
-	var uploaded int64 = 0
+	var uploaded int64
 
 	for {
 		n, err := io.ReadFull(in, buf)
@@ -761,7 +763,7 @@ func (o *Object) upload(ctx context.Context, in io.Reader, size int64) error {
 	if err != nil {
 		return fmt.Errorf("合并文件失败: %w", err)
 	}
-	o.id = strconv.FormatUint(file.FsId, 10)
+	o.id = strconv.FormatUint(file.FsID, 10)
 	o.path = file.Path
 	return nil
 }
@@ -849,7 +851,7 @@ func (o *Object) sliceUpload(ctx context.Context, remote string, in io.Reader, s
 }
 
 // 合并上传 (createsuperfile)
-func (o *Object) complete(ctx context.Context, remote, md5ListJson string) (FileEntity, error) {
+func (o *Object) complete(ctx context.Context, remote, md5ListJSON string) (FileEntity, error) {
 	opts := &rest.Opts{
 		Method:  "POST",
 		RootURL: uploadURL,
@@ -859,7 +861,7 @@ func (o *Object) complete(ctx context.Context, remote, md5ListJson string) (File
 			"path":   {remote},
 			"ondup":  {"overwrite"},
 		},
-		Body: bytes.NewBuffer([]byte(fmt.Sprintf("param=%s", `{"block_list":`+md5ListJson+`}`))),
+		Body: bytes.NewBuffer([]byte(fmt.Sprintf("param=%s", `{"block_list":`+md5ListJSON+`}`))),
 	}
 	resp := FileEntity{}
 	err := o.fs.call(ctx, opts, &resp)
@@ -883,9 +885,9 @@ func (o *Object) setMetaData(info *FileEntity) (err error) {
 		return fs.ErrorIsDir
 	}
 	o.hasMetaData = true
-	o.size = int64(info.Size)
-	o.modTime = time.Unix(int64(info.ServerMtime), 0)
-	o.id = strconv.FormatUint(info.FsId, 10)
+	o.size = info.Size
+	o.modTime = time.Unix(info.ServerMtime, 0)
+	o.id = strconv.FormatUint(info.FsID, 10)
 	o.path = info.Path
 	o.remote = info.Path
 	return nil
