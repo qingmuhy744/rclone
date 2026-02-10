@@ -1,5 +1,5 @@
 ---
-# Github Actions build for rclone
+# Github Actions build
 # -*- compile-command: "yamllint -f parsable build.yml" -*-
 
 name: build
@@ -21,7 +21,7 @@ on:
 
 jobs:
   build:
-    if: inputs.manual || (github.repository == 'rclone/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))
+    if: inputs.manual || (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name)
     timeout-minutes: 60
     defaults:
       run:
@@ -167,7 +167,16 @@ jobs:
 
       - name: Rclone version
         run: |
-          rclone version
+          ./rclone version
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclone-${{ matrix.job_name }}
+          path: |
+            rclone
+            rclone.exe
+          if-no-files-found: ignore
 
       - name: Run tests
         run: |
@@ -203,7 +212,7 @@ jobs:
         if: env.RCLONE_CONFIG_PASS != '' && matrix.deploy && github.head_ref == '' && github.repository == 'rclone/rclone'
 
   lint:
-    if: inputs.manual || (github.repository == 'rclone/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))
+    if: inputs.manual || (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name)
     timeout-minutes: 30
     name: "lint"
     runs-on: ubuntu-latest
@@ -300,7 +309,7 @@ jobs:
         if: github.event_name == 'pull_request'
 
   android:
-    if: inputs.manual || (github.repository == 'rclone/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))
+    if: inputs.manual || (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name)
     timeout-minutes: 30
     name: "android-all"
     runs-on: ubuntu-latest

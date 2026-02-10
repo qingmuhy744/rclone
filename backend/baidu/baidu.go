@@ -44,8 +44,8 @@ const (
 	uriQuota      = "/api/quota"
 
 	//
-	chunkSize         = 4 * 1024 * 1024 //分片大小4M
-	rapidUploadThreshold = 256 * 1024    //秒传阈值256KB
+	chunkSize            = 4 * 1024 * 1024 //分片大小4M
+	rapidUploadThreshold = 256 * 1024      //秒传阈值256KB
 )
 
 // Options defines the configuration for this backend
@@ -182,7 +182,7 @@ func (f *Fs) reWriteConfig() {
 		if err != nil {
 			t = time.Now()
 		}
-		sub := t.Sub(time.Now())
+		sub := time.Until(t)
 		if sub < 0 {
 			sub = 5 * time.Minute
 		}
@@ -794,8 +794,8 @@ func (o *Object) rapidUpload(ctx context.Context, remote, contentMD5, sliceMD5, 
 		RootURL: uploadUrl,
 		Path:    uriPCSFile,
 		Parameters: map[string][]string{
-			"method":       {"rapidupload"},
-			"path":         {remote},
+			"method":         {"rapidupload"},
+			"path":           {remote},
 			"content-length": {strconv.FormatInt(size, 10)},
 			"content-md5":    {contentMD5},
 			"slice-md5":      {sliceMD5},
