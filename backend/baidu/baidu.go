@@ -44,8 +44,8 @@ const (
 	uriQuota      = "/api/quota"
 
 	//
-	chunkSize            = 4 * 1024 * 1024 //分片大小4M
-	rapidUploadThreshold = 256 * 1024      //秒传阈值256KB
+	chunkSize            = 4 * 1024 * 1024 // 分片大小锁定为 4M (官方黄金标准，普通用户与会员通用)
+	rapidUploadThreshold = 256 * 1024      // 秒传阈值 256KB
 )
 
 // Options defines the configuration for this backend
@@ -390,6 +390,7 @@ func (f *Fs) listDirFile(ctx context.Context, dir string, start, limit int) ([]F
 			"web":          {"1"},
 			"folder":       {"0"},
 			"showempty":    {"1"},
+			"openapi":      {"xpansdk"},
 		},
 	}
 	resp := &FileListOut{}
@@ -615,17 +616,20 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 // About gets quota information
 func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	opts := &rest.Opts{
-		Method:     "GET",
-		RootURL:    rootURL,
-		Path:       uriQuota,
-		Parameters: map[string][]string{},
+		Method:  "GET",
+		RootURL: rootURL,
+		Path:    uriQuota,
+		Parameters: map[string][]string{
+			"openapi": {"xpansdk"},
+		},
 	}
 	resp := QuotaOut{}
-	if err = f.call(ctx, opts, resp); err != nil {
+	if err = f.call(ctx, opts, &resp); err != nil {
 		return nil, err
 	}
+	free := resp.Total - resp.Used
 	usage = &fs.Usage{
-		Free:  &resp.Free,
+		Free:  &free, // 百度接口返回 Free 常为 0，在此手动计算以满足 rclone 展示
 		Total: &resp.Total,
 		Used:  &resp.Used,
 	}
@@ -761,52 +765,167 @@ func (o *Object) upload(ctx context.Context, in io.Reader, size int64) error {
 		}
 	}
 
-	// 2. 对于 2GB 以下文件，使用单次上传 (Simple Upload) 绕过分片上传 Bug (31064)
-	if size <= 2*1024*1024*1024 {
+	// 2. 对于 4MB 以下文件，使用单次上传 (Simple Upload)
+	// 根据官方文档，4MB 以上必须分片，PCS 的简单上传通道在超限时会不稳定 (易中断)
+	if size <= 4*1024*1024 && size >= 0 {
 		return o.simpleUpload(ctx, in, size)
 	}
 
-	// 3. 超过 2GB 或流式大数据量时，使用 XPAN 三阶段分片上传
-	// 注意：分片上传目前在部分账户/应用下可能报 31064 错误
+	// 3. 超过 4MB 使用 XPAN 分片上传 (superfile2)
+	// 3. 超过 4MB 使用 XPAN 分片上传 (superfile2)
+	// 注意：由于 rclone 内部可能使用 AsyncReader 包装，无法可靠检测 Seek 支持
+	// 因此统一使用 Disk Spooling 模式（写盘缓存）处理大文件，避免内存 OOM
+
 	var md5s []string
-	var chunks [][]byte
-	buf := make([]byte, chunkSize)
+	var uploadSource io.ReaderAt
+	// 如果是 Seeker（本地文件），可以直接使用
+	if seeker, ok := in.(io.ReadSeeker); ok {
+		// 再次尝试 Seek Detect，排除 AsyncReader 的假实现
+		if _, err := seeker.Seek(0, io.SeekCurrent); err == nil {
+			fs.Debugf(o, "检测到本地文件流，开启双读流式上传模式")
+			uploadSource = seeker.(io.ReaderAt) // os.File implements ReaderAt
 
-	for {
-		n, err := io.ReadFull(in, buf)
-		if n > 0 {
-			chunkCopy := make([]byte, n)
-			copy(chunkCopy, buf[:n])
-			chunks = append(chunks, chunkCopy)
+			// 第一遍：计算所有分片的 MD5
+			buf := make([]byte, chunkSize)
+			for {
+				n, err := io.ReadFull(seeker, buf)
+				if n > 0 {
+					h := md5.New()
+					h.Write(buf[:n])
+					md5s = append(md5s, hex.EncodeToString(h.Sum(nil)))
+				}
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					break
+				}
+				if err != nil {
+					return fmt.Errorf("扫描文件 MD5 失败: %w", err)
+				}
+			}
 
-			h := md5.New()
-			h.Write(chunkCopy)
-			md5s = append(md5s, hex.EncodeToString(h.Sum(nil)))
-		}
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
-		}
-		if err != nil {
-			return err
+			// 复位偏移量
+			if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+				return fmt.Errorf("复位文件指针失败: %w", err)
+			}
+
+			goto DoUpload
 		}
 	}
 
-	// 预上传 (Precreate)
+	// 如果非 Seeker 且文件较大 (>128MB)，使用临时文件缓存，避免内存溢出
+	if size > 128*1024*1024 {
+		fs.Debugf(o, "大文件上传 (>128MB) 且无法 Seek，启用磁盘缓存模式...")
+		tempFile, err := os.CreateTemp("", "rclone-baidu-upload-*")
+		if err != nil {
+			return fmt.Errorf("创建临时缓存文件失败: %w", err)
+		}
+		defer func() {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+		}()
+
+		uploadSource = tempFile // os.File implements ReaderAt
+
+		buf := make([]byte, chunkSize)
+		for {
+			n, err := io.ReadFull(in, buf)
+			if n > 0 {
+				// 写入临时文件
+				if _, err := tempFile.Write(buf[:n]); err != nil {
+					return fmt.Errorf("写入临时缓存文件失败: %w", err)
+				}
+
+				// 计算 MD5
+				h := md5.New()
+				h.Write(buf[:n])
+				md5s = append(md5s, hex.EncodeToString(h.Sum(nil)))
+			}
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
+		}
+
+		// 确保数据落盘
+		if err := tempFile.Sync(); err != nil {
+			return fmt.Errorf("同步临时文件失败: %w", err)
+		}
+
+		goto DoUpload
+	}
+
+	// 4. 对于较小的流式输入 (<=128MB)，缓冲至内存 (速度快)
+	{
+		fs.Debugf(o, "小文件流式上传 (<=128MB)，全量缓存至内存处理...")
+		var chunks [][]byte
+		buf := make([]byte, chunkSize)
+
+		for {
+			n, err := io.ReadFull(in, buf)
+			if n > 0 {
+				chunkCopy := make([]byte, n)
+				copy(chunkCopy, buf[:n])
+				chunks = append(chunks, chunkCopy)
+
+				h := md5.New()
+				h.Write(chunkCopy)
+				md5s = append(md5s, hex.EncodeToString(h.Sum(nil)))
+			}
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
+		}
+
+		preResp, err := o.precreate(ctx, remote, size, md5s)
+		if err != nil {
+			return fmt.Errorf("precreate 失败: %w", err)
+		}
+		uploadID := preResp.UploadID
+
+		for i, chunkData := range chunks {
+			_, err := o.sliceUpload(ctx, remote, uploadID, i, bytes.NewReader(chunkData), int64(len(chunkData)))
+			if err != nil {
+				return fmt.Errorf("分片 %d 上传失败: %w", i, err)
+			}
+		}
+
+		md5ListBytes, _ := json.Marshal(md5s)
+		file, err := o.complete(ctx, remote, uploadID, size, string(md5ListBytes))
+		if err != nil {
+			return fmt.Errorf("合并文件失败: %w", err)
+		}
+		o.id = strconv.FormatUint(file.FsID, 10)
+		o.path = file.Path
+		return nil
+	}
+
+DoUpload:
 	preResp, err := o.precreate(ctx, remote, size, md5s)
 	if err != nil {
 		return fmt.Errorf("precreate 失败: %w", err)
 	}
 	uploadID := preResp.UploadID
 
-	// 分片上传 (SliceUpload)
-	for i, chunkData := range chunks {
-		_, err := o.sliceUpload(ctx, remote, uploadID, i, bytes.NewReader(chunkData), int64(len(chunkData)))
-		if err != nil {
+	for i := 0; i < len(md5s); i++ {
+		var currentChunkSize int64
+		if i == len(md5s)-1 {
+			currentChunkSize = size - int64(i)*int64(chunkSize)
+		} else {
+			currentChunkSize = int64(chunkSize)
+		}
+
+		// 使用 SectionReader 读取指定分片
+		// uploadSource 必须是 io.ReaderAt (os.File 满足)
+		sectionReader := io.NewSectionReader(uploadSource, int64(i)*int64(chunkSize), currentChunkSize)
+		if _, err := o.sliceUpload(ctx, remote, uploadID, i, sectionReader, currentChunkSize); err != nil {
 			return fmt.Errorf("分片 %d 上传失败: %w", i, err)
 		}
 	}
 
-	// 调用 Create 提交
 	md5ListBytes, _ := json.Marshal(md5s)
 	file, err := o.complete(ctx, remote, uploadID, size, string(md5ListBytes))
 	if err != nil {
@@ -826,6 +945,7 @@ func (o *Object) precreate(ctx context.Context, remote string, size int64, md5s 
 	v.Set("autoinit", "1")
 	v.Set("rtype", "3")
 	v.Set("block_list", string(md5ListJSON))
+	v.Set("openapi", "xpansdk")
 
 	opts := &rest.Opts{
 		Method:  "POST",
@@ -892,6 +1012,7 @@ func (o *Object) rapidUpload(ctx context.Context, remote, contentMD5, sliceMD5 s
 			"slice-md5":      {sliceMD5},
 			"content-crc32":  {fmt.Sprintf("%d", crc32Val)},
 			"ondup":          {"overwrite"},
+			"openapi":        {"xpansdk"},
 		},
 	}
 	resp := RapidUploadOut{}
@@ -917,9 +1038,10 @@ func (o *Object) simpleUpload(ctx context.Context, in io.Reader, size int64) err
 			"User-Agent": "netdisk;P2SP;8.3.1.2;PC;PC-Windows;10.0.19042;WindowsBaiduYunGuanJia",
 		},
 		Parameters: map[string][]string{
-			"method": {"upload"},
-			"path":   {remote},
-			"ondup":  {"overwrite"},
+			"method":  {"upload"},
+			"path":    {remote},
+			"ondup":   {"overwrite"},
+			"openapi": {"xpansdk"},
 		},
 		Body: formReader,
 	}
@@ -943,7 +1065,7 @@ func (o *Object) sliceUpload(ctx context.Context, remote, uploadID string, partS
 	opts := &rest.Opts{
 		Method:        "POST",
 		RootURL:       uploadURL,
-		Path:          uriPCSFile,
+		Path:          uriSuperFile,
 		ContentType:   contentType,
 		ContentLength: &contentLength,
 		ExtraHeaders: map[string]string{
@@ -955,6 +1077,7 @@ func (o *Object) sliceUpload(ctx context.Context, remote, uploadID string, partS
 			"path":     {remote},
 			"uploadid": {uploadID},
 			"partseq":  {strconv.Itoa(partSeq)},
+			"openapi":  {"xpansdk"},
 		},
 		Body: formReader,
 	}
@@ -974,6 +1097,7 @@ func (o *Object) complete(ctx context.Context, remote, uploadID string, size int
 	v.Set("uploadid", uploadID)
 	// block_list 需要是 ["...", "..."] 的 JSON 数组格式
 	v.Set("block_list", md5ListJSON)
+	v.Set("openapi", "xpansdk")
 
 	opts := &rest.Opts{
 		Method:  "POST",
