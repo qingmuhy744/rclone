@@ -19,13 +19,20 @@
 # Rclone (Custom Fork with Baidu Backend Optimization)
 
 > [!IMPORTANT]
-> This is a customized fork of [rclone](https://github.com/rclone/rclone) maintained for optimized **Baidu Netdisk (BaiduYun)** support.
+> This is a customized fork of [rclone](https://github.com/rclone/rclone)
+> maintained for optimized **Baidu Netdisk (BaiduYun)** support.
 
-### Key Enhancements in this Fork:
-- **Bypy-style Streaming Upload**: Re-implemented the Baidu upload logic to use in-memory chunking. Enjoy **zero additional disk overhead** even when uploading terabyte-sized files.
-- **Rapid Upload (秒传) Support**: Automatically calculates MD5, Slice-MD5, and CRC32 to instantly upload files already present on Baidu servers.
-- **Pipe/Stream Friendly**: Fully supports uploading from standard input or pipes without temporary files.
-- **Docker GHCR Integration**: Automated CI pushes multi-arch images directly to GitHub Container Registry (`ghcr.io/qingmuhy744/rclone`).
+## Key Enhancements in this Fork
+
+- **Bypy-style Streaming Upload**: Re-implemented the Baidu upload logic to
+  use in-memory chunking. Enjoy **zero additional disk overhead** even when
+  uploading terabyte-sized files.
+- **Rapid Upload (秒传) Support**: Automatically calculates MD5, Slice-MD5,
+  and CRC32 to instantly upload files already present on Baidu servers.
+- **Pipe/Stream Friendly**: Fully supports uploading from standard input or
+  pipes without temporary files.
+- **Docker GHCR Integration**: Automated CI pushes multi-arch images directly
+  to GitHub Container Registry (`ghcr.io/qingmuhy744/rclone`).
 
 ---
 
