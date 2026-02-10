@@ -16,7 +16,18 @@
 [![GoDoc](https://godoc.org/github.com/rclone/rclone?status.svg)](https://godoc.org/github.com/rclone/rclone)
 [![Docker Pulls](https://img.shields.io/docker/pulls/rclone/rclone)](https://hub.docker.com/r/rclone/rclone)
 
-# Rclone
+# Rclone (Custom Fork with Baidu Backend Optimization)
+
+> [!IMPORTANT]
+> This is a customized fork of [rclone](https://github.com/rclone/rclone) maintained for optimized **Baidu Netdisk (BaiduYun)** support.
+
+### Key Enhancements in this Fork:
+- **Bypy-style Streaming Upload**: Re-implemented the Baidu upload logic to use in-memory chunking. Enjoy **zero additional disk overhead** even when uploading terabyte-sized files.
+- **Rapid Upload (秒传) Support**: Automatically calculates MD5, Slice-MD5, and CRC32 to instantly upload files already present on Baidu servers.
+- **Pipe/Stream Friendly**: Fully supports uploading from standard input or pipes without temporary files.
+- **Docker GHCR Integration**: Automated CI pushes multi-arch images directly to GitHub Container Registry (`ghcr.io/qingmuhy744/rclone`).
+
+---
 
 Rclone *("rsync for cloud storage")* is a command-line program to sync files and
 directories to and from different cloud storage providers.
