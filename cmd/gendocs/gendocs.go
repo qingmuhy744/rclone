@@ -4,16 +4,17 @@ package gendocs
 import (
 	"bytes"
 	"fmt"
-	"log"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"text/template"
 	"time"
 
 	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/rclone/rclone/lib/file"
 	"github.com/spf13/cobra"
@@ -29,17 +30,20 @@ type frontmatter struct {
 	Date        string
 	Title       string
 	Description string
-	Slug        string
-	URL         string
 	Source      string
+	Aliases     []string
 	Annotations map[string]string
 }
 
 var frontmatterTemplate = template.Must(template.New("frontmatter").Parse(`---
 title: "{{ .Title }}"
 description: "{{ .Description }}"
-slug: {{ .Slug }}
-url: {{ .URL }}
+{{- if .Aliases }}
+aliases:
+{{- range $value := .Aliases }}
+  - {{ $value }}
+{{- end }}
+{{- end }}
 {{- range $key, $value := .Annotations }}
 {{ $key }}: {{  $value }}
 {{- end }}
@@ -50,8 +54,7 @@ url: {{ .URL }}
 var commandDefinition = &cobra.Command{
 	Use:   "gendocs output_directory",
 	Short: `Output markdown docs for rclone to the directory supplied.`,
-	Long: `
-This produces markdown docs for the rclone commands to the directory
+	Long: `This produces markdown docs for the rclone commands to the directory
 supplied.  These are in a format suitable for hugo to render into the
 rclone.org website.`,
 	Annotations: map[string]string{
@@ -71,7 +74,7 @@ rclone.org website.`,
 
 		// Write the flags page
 		var buf bytes.Buffer
-		cmd.Root.SetOutput(&buf)
+		cmd.Root.SetOut(&buf)
 		cmd.Root.SetArgs([]string{"help", "flags"})
 		cmd.GeneratingDocs = true
 		err = cmd.Root.Execute()
@@ -86,23 +89,37 @@ rclone.org website.`,
 		// Look up name => details for prepender
 		type commandDetails struct {
 			Short       string
+			Aliases     []string
 			Annotations map[string]string
 		}
-		var commands = map[string]commandDetails{}
-		var aliases []string
-		var addCommandDetails func(root *cobra.Command)
-		addCommandDetails = func(root *cobra.Command) {
+		commands := map[string]commandDetails{}
+		var addCommandDetails func(root *cobra.Command, parentAliases []string)
+		addCommandDetails = func(root *cobra.Command, parentAliases []string) {
 			name := strings.ReplaceAll(root.CommandPath(), " ", "_") + ".md"
+			var aliases []string
+			for _, p := range parentAliases {
+				aliases = append(aliases, p+" "+root.Name())
+				for _, v := range root.Aliases {
+					aliases = append(aliases, p+" "+v)
+				}
+			}
+			for _, v := range root.Aliases {
+				if root.HasParent() {
+					aliases = append(aliases, root.Parent().CommandPath()+" "+v)
+				} else {
+					aliases = append(aliases, v)
+				}
+			}
 			commands[name] = commandDetails{
 				Short:       root.Short,
+				Aliases:     aliases,
 				Annotations: root.Annotations,
 			}
-			aliases = append(aliases, root.Aliases...)
 			for _, c := range root.Commands() {
-				addCommandDetails(c)
+				addCommandDetails(c, aliases)
 			}
 		}
-		addCommandDetails(cmd.Root)
+		addCommandDetails(cmd.Root, []string{})
 
 		// markup for the docs files
 		prepender := func(filename string) string {
@@ -112,15 +129,23 @@ rclone.org website.`,
 				Date:        now,
 				Title:       strings.ReplaceAll(base, "_", " "),
 				Description: commands[name].Short,
-				Slug:        base,
-				URL:         "/commands/" + strings.ToLower(base) + "/",
 				Source:      strings.ReplaceAll(strings.ReplaceAll(base, "rclone", "cmd"), "_", "/") + "/",
-				Annotations: commands[name].Annotations,
+				Aliases:     []string{},
+				Annotations: map[string]string{},
+			}
+			for _, v := range commands[name].Aliases {
+				data.Aliases = append(data.Aliases, "/commands/"+strings.ReplaceAll(v, " ", "_")+"/")
+			}
+			// Filter out annotations that confuse hugo from the frontmatter
+			for k, v := range commands[name].Annotations {
+				if k != "groups" {
+					data.Annotations[k] = v
+				}
 			}
 			var buf bytes.Buffer
 			err := frontmatterTemplate.Execute(&buf, data)
 			if err != nil {
-				log.Fatalf("Failed to render frontmatter template: %v", err)
+				fs.Fatalf(nil, "Failed to render frontmatter template: %v", err)
 			}
 			return buf.String()
 		}
@@ -134,7 +159,7 @@ rclone.org website.`,
 			return err
 		}
 
-		var outdentTitle = regexp.MustCompile(`(?m)^#(#+)`)
+		outdentTitle := regexp.MustCompile(`(?m)^#(#+)`)
 
 		// Munge the files to add a link to the global flags page
 		err = filepath.Walk(out, func(path string, info os.FileInfo, err error) error {
@@ -145,9 +170,17 @@ rclone.org website.`,
 				name := filepath.Base(path)
 				cmd, ok := commands[name]
 				if !ok {
-					// Avoid man pages which are for aliases. This is a bit messy!
-					for _, alias := range aliases {
-						if strings.Contains(name, alias) {
+					switch name {
+					case "rclone_mount.md":
+						switch runtime.GOOS {
+						case "darwin", "windows":
+							fs.Logf(nil, "Skipping docs for command not available without the cmount build tag: %v", name)
+							return nil
+						}
+					case "rclone_nfsmount.md", "rclone_serve_nfs.md":
+						switch runtime.GOOS {
+						case "windows":
+							fs.Logf(nil, "Skipping docs for command not supported on %v: %v", runtime.GOOS, name)
 							return nil
 						}
 					}
@@ -159,33 +192,46 @@ rclone.org website.`,
 				}
 				doc := string(b)
 
-				var out strings.Builder
-				if groupsString := cmd.Annotations["groups"]; groupsString != "" {
-					groups := flags.All.Include(groupsString)
-					for _, group := range groups.Groups {
-						if group.Flags.HasFlags() {
-							_, _ = fmt.Fprintf(&out, "\n### %s Options\n\n", group.Name)
-							_, _ = fmt.Fprintf(&out, "%s\n\n", group.Help)
-							_, _ = fmt.Fprintln(&out, "```")
-							_, _ = out.WriteString(group.Flags.FlagUsages())
-							_, _ = fmt.Fprintln(&out, "```")
-						}
-					}
-				}
-				_, _ = out.WriteString(`
-See the [global flags page](/flags/) for global options not listed here.
-
-`)
-
 				startCut := strings.Index(doc, `### Options inherited from parent commands`)
-				endCut := strings.Index(doc, `## SEE ALSO`)
+				endCut := strings.Index(doc, `### SEE ALSO`)
 				if startCut < 0 || endCut < 0 {
-					if name == "rclone.md" {
-						return nil
+					if name != "rclone.md" {
+						return fmt.Errorf("internal error: failed to find cut points: startCut = %d, endCut = %d", startCut, endCut)
 					}
-					return fmt.Errorf("internal error: failed to find cut points: startCut = %d, endCut = %d", startCut, endCut)
+					if endCut >= 0 {
+						doc = doc[:endCut] + `### See Also
+
+<!-- markdownlint-capture -->
+<!-- markdownlint-disable ul-style line-length -->` + doc[endCut+12:] + `
+<!-- markdownlint-restore -->
+`
+					}
+				} else {
+					var out strings.Builder
+					if groupsString := cmd.Annotations["groups"]; groupsString != "" {
+						_, _ = out.WriteString("Options shared with other commands are described next.\n")
+						_, _ = out.WriteString("See the [global flags page](/flags/) for global options not listed here.\n\n")
+						groups := flags.All.Include(groupsString)
+						for _, group := range groups.Groups {
+							if group.Flags.HasFlags() {
+								_, _ = fmt.Fprintf(&out, "#### %s Options\n\n", group.Name)
+								_, _ = fmt.Fprintf(&out, "%s\n\n", group.Help)
+								_, _ = out.WriteString("```text\n")
+								_, _ = out.WriteString(group.Flags.FlagUsages())
+								_, _ = out.WriteString("```\n\n")
+							}
+						}
+					} else {
+						_, _ = out.WriteString("See the [global flags page](/flags/) for global options not listed here.\n\n")
+					}
+					doc = doc[:startCut] + out.String() + `### See Also
+
+<!-- markdownlint-capture -->
+<!-- markdownlint-disable ul-style line-length -->` + doc[endCut+12:] + `
+<!-- markdownlint-restore -->
+`
 				}
-				doc = doc[:startCut] + out.String() + doc[endCut:]
+
 				// outdent all the titles by one
 				doc = outdentTitle.ReplaceAllString(doc, `$1`)
 				err = os.WriteFile(path, []byte(doc), 0777)

@@ -157,7 +157,7 @@ func TestStatsTotalDuration(t *testing.T) {
 		s.AddTransfer(tr1)
 
 		s.mu.Lock()
-		total := s.totalDuration()
+		total := s._totalDuration()
 		s.mu.Unlock()
 
 		assert.Equal(t, 1, len(s.startedTransfers))
@@ -175,7 +175,7 @@ func TestStatsTotalDuration(t *testing.T) {
 		s.AddTransfer(tr1)
 
 		s.mu.Lock()
-		total := s.totalDuration()
+		total := s._totalDuration()
 		s.mu.Unlock()
 
 		assert.Equal(t, time.Since(time1)/time.Second, total/time.Second)
@@ -213,7 +213,7 @@ func TestStatsTotalDuration(t *testing.T) {
 		time.Sleep(time.Millisecond)
 
 		s.mu.Lock()
-		total := s.totalDuration()
+		total := s._totalDuration()
 		s.mu.Unlock()
 
 		assert.Equal(t, time.Duration(30), total/time.Second)
@@ -244,7 +244,7 @@ func TestStatsTotalDuration(t *testing.T) {
 		})
 
 		s.mu.Lock()
-		total := s.totalDuration()
+		total := s._totalDuration()
 		s.mu.Unlock()
 
 		assert.Equal(t, startTime.Sub(time1)/time.Second, total/time.Second)
@@ -265,7 +265,7 @@ func TestRemoteStats(t *testing.T) {
 		}
 		s.AddTransfer(tr1)
 		time.Sleep(time.Millisecond)
-		rs, err := s.RemoteStats()
+		rs, err := s.RemoteStats(false)
 
 		require.NoError(t, err)
 		assert.Equal(t, float64(10), rs["transferTime"])
@@ -449,19 +449,43 @@ func TestPruneTransfers(t *testing.T) {
 			}
 
 			s.mu.Lock()
-			assert.Equal(t, time.Duration(test.Transfers)*time.Second, s.totalDuration())
+			assert.Equal(t, time.Duration(test.Transfers)*time.Second, s._totalDuration())
 			assert.Equal(t, test.Transfers, len(s.startedTransfers))
 			s.mu.Unlock()
 
-			for i := 0; i < test.Transfers; i++ {
+			for range test.Transfers {
 				s.PruneTransfers()
 			}
 
 			s.mu.Lock()
-			assert.Equal(t, time.Duration(test.Transfers)*time.Second, s.totalDuration())
+			assert.Equal(t, time.Duration(test.Transfers)*time.Second, s._totalDuration())
 			assert.Equal(t, test.ExpectedStartedTransfers, len(s.startedTransfers))
 			s.mu.Unlock()
 
 		})
 	}
+}
+
+func TestRemoveDoneTransfers(t *testing.T) {
+	ctx := context.Background()
+	s := NewStats(ctx)
+	const transfers = 10
+	for i := int64(1); i <= int64(transfers); i++ {
+		s.AddTransfer(&Transfer{
+			startedAt:   time.Unix(i, 0),
+			completedAt: time.Unix(i+1, 0),
+		})
+	}
+
+	s.mu.Lock()
+	assert.Equal(t, time.Duration(transfers)*time.Second, s._totalDuration())
+	assert.Equal(t, transfers, len(s.startedTransfers))
+	s.mu.Unlock()
+
+	s.RemoveDoneTransfers()
+
+	s.mu.Lock()
+	assert.Equal(t, time.Duration(transfers)*time.Second, s._totalDuration())
+	assert.Equal(t, transfers, len(s.startedTransfers))
+	s.mu.Unlock()
 }

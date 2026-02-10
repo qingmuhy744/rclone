@@ -5,6 +5,7 @@ package api
 
 import (
 	"fmt"
+	"net/url"
 	"reflect"
 	"strconv"
 	"time"
@@ -53,7 +54,7 @@ const (
 	PhaseTypePending    = "PHASE_TYPE_PENDING"
 	UploadTypeForm      = "UPLOAD_TYPE_FORM"
 	UploadTypeResumable = "UPLOAD_TYPE_RESUMABLE"
-	ListLimit           = 100
+	ListLimit           = 500
 )
 
 // ------------------------------------------------------------
@@ -71,15 +72,14 @@ type Error struct {
 
 // ErrorDetails contains further details of api error
 type ErrorDetails struct {
-	Type     string `json:"@type,omitempty"`
-	Reason   string `json:"reason,omitempty"`
-	Domain   string `json:"domain,omitempty"`
-	Metadata struct {
-	} `json:"metadata,omitempty"` // TODO: undiscovered yet
-	Locale       string        `json:"locale,omitempty"` // e.g. "en"
-	Message      string        `json:"message,omitempty"`
-	StackEntries []interface{} `json:"stack_entries,omitempty"` // TODO: undiscovered yet
-	Detail       string        `json:"detail,omitempty"`
+	Type         string   `json:"@type,omitempty"`
+	Reason       string   `json:"reason,omitempty"`
+	Domain       string   `json:"domain,omitempty"`
+	Metadata     struct{} `json:"metadata,omitempty"` // TODO: undiscovered yet
+	Locale       string   `json:"locale,omitempty"`   // e.g. "en"
+	Message      string   `json:"message,omitempty"`
+	StackEntries []any    `json:"stack_entries,omitempty"` // TODO: undiscovered yet
+	Detail       string   `json:"detail,omitempty"`
 }
 
 // Error returns a string for the error and satisfies the error interface
@@ -137,8 +137,25 @@ type Link struct {
 }
 
 // Valid reports whether l is non-nil, has an URL, and is not expired.
+// It primarily checks the URL's expire query parameter, falling back to the Expire field.
 func (l *Link) Valid() bool {
-	return l != nil && l.URL != "" && time.Now().Add(10*time.Second).Before(time.Time(l.Expire))
+	if l == nil || l.URL == "" {
+		return false
+	}
+
+	// Primary validation: check URL's expire query parameter
+	if u, err := url.Parse(l.URL); err == nil {
+		if expireStr := u.Query().Get("expire"); expireStr != "" {
+			// Try parsing as Unix timestamp (seconds)
+			if expireInt, err := strconv.ParseInt(expireStr, 10, 64); err == nil {
+				expireTime := time.Unix(expireInt, 0)
+				return time.Now().Add(10 * time.Second).Before(expireTime)
+			}
+		}
+	}
+
+	// Fallback validation: use the Expire field if URL parsing didn't work
+	return time.Now().Add(10 * time.Second).Before(time.Time(l.Expire))
 }
 
 // URL is a basic form of URL
@@ -157,6 +174,7 @@ type FileList struct {
 	NextPageToken   string  `json:"next_page_token"`
 	Version         string  `json:"version,omitempty"`
 	VersionOutdated bool    `json:"version_outdated,omitempty"`
+	SyncTime        Time    `json:"sync_time"`
 }
 
 // File is a basic element representing a single file object
@@ -166,43 +184,46 @@ type FileList struct {
 // 2) the other from File.Medias[].Link.URL.
 // Empirically, 2) is less restrictive to multiple concurrent range-requests
 // for a single file, i.e. supports for higher `--multi-thread-streams=N`.
-// However, it is not generally applicable as it is only for meadia.
+// However, it is not generally applicable as it is only for media.
 type File struct {
-	Apps              []*FileApp    `json:"apps,omitempty"`
-	Audit             *FileAudit    `json:"audit,omitempty"`
-	Collection        string        `json:"collection,omitempty"` // TODO
-	CreatedTime       Time          `json:"created_time,omitempty"`
-	DeleteTime        Time          `json:"delete_time,omitempty"`
-	FileCategory      string        `json:"file_category,omitempty"`
-	FileExtension     string        `json:"file_extension,omitempty"`
-	FolderType        string        `json:"folder_type,omitempty"`
-	Hash              string        `json:"hash,omitempty"` // sha1 but NOT a valid file hash. looks like a torrent hash
-	IconLink          string        `json:"icon_link,omitempty"`
-	ID                string        `json:"id,omitempty"`
-	Kind              string        `json:"kind,omitempty"` // "drive#file"
-	Links             *FileLinks    `json:"links,omitempty"`
-	Md5Checksum       string        `json:"md5_checksum,omitempty"`
-	Medias            []*Media      `json:"medias,omitempty"`
-	MimeType          string        `json:"mime_type,omitempty"`
-	ModifiedTime      Time          `json:"modified_time,omitempty"` // updated when renamed or moved
-	Name              string        `json:"name,omitempty"`
-	OriginalFileIndex int           `json:"original_file_index,omitempty"` // TODO
-	OriginalURL       string        `json:"original_url,omitempty"`
-	Params            *FileParams   `json:"params,omitempty"`
-	ParentID          string        `json:"parent_id,omitempty"`
-	Phase             string        `json:"phase,omitempty"`
-	Revision          int           `json:"revision,omitempty,string"`
-	Size              int64         `json:"size,omitempty,string"`
-	SortName          string        `json:"sort_name,omitempty"`
-	Space             string        `json:"space,omitempty"`
-	SpellName         []interface{} `json:"spell_name,omitempty"` // TODO maybe list of something?
-	Starred           bool          `json:"starred,omitempty"`
-	ThumbnailLink     string        `json:"thumbnail_link,omitempty"`
-	Trashed           bool          `json:"trashed,omitempty"`
-	UserID            string        `json:"user_id,omitempty"`
-	UserModifiedTime  Time          `json:"user_modified_time,omitempty"`
-	WebContentLink    string        `json:"web_content_link,omitempty"`
-	Writable          bool          `json:"writable,omitempty"`
+	Apps              []*FileApp  `json:"apps,omitempty"`
+	Audit             *FileAudit  `json:"audit,omitempty"`
+	Collection        string      `json:"collection,omitempty"` // TODO
+	CreatedTime       Time        `json:"created_time,omitempty"`
+	DeleteTime        Time        `json:"delete_time,omitempty"`
+	FileCategory      string      `json:"file_category,omitempty"` // "AUDIO", "VIDEO"
+	FileExtension     string      `json:"file_extension,omitempty"`
+	FolderType        string      `json:"folder_type,omitempty"`
+	Hash              string      `json:"hash,omitempty"` // custom hash with a form of sha1sum
+	IconLink          string      `json:"icon_link,omitempty"`
+	ID                string      `json:"id,omitempty"`
+	Kind              string      `json:"kind,omitempty"` // "drive#file"
+	Links             *FileLinks  `json:"links,omitempty"`
+	Md5Checksum       string      `json:"md5_checksum,omitempty"`
+	Medias            []*Media    `json:"medias,omitempty"`
+	MimeType          string      `json:"mime_type,omitempty"`
+	ModifiedTime      Time        `json:"modified_time,omitempty"` // updated when renamed or moved
+	Name              string      `json:"name,omitempty"`
+	OriginalFileIndex int         `json:"original_file_index,omitempty"` // TODO
+	OriginalURL       string      `json:"original_url,omitempty"`
+	Params            *FileParams `json:"params,omitempty"`
+	ParentID          string      `json:"parent_id,omitempty"`
+	Phase             string      `json:"phase,omitempty"`
+	Revision          int         `json:"revision,omitempty,string"`
+	ReferenceEvents   []any       `json:"reference_events"`
+	ReferenceResource any         `json:"reference_resource"`
+	Size              int64       `json:"size,omitempty,string"`
+	SortName          string      `json:"sort_name,omitempty"`
+	Space             string      `json:"space,omitempty"`
+	SpellName         []any       `json:"spell_name,omitempty"` // TODO maybe list of something?
+	Starred           bool        `json:"starred,omitempty"`
+	Tags              []any       `json:"tags"`
+	ThumbnailLink     string      `json:"thumbnail_link,omitempty"`
+	Trashed           bool        `json:"trashed,omitempty"`
+	UserID            string      `json:"user_id,omitempty"`
+	UserModifiedTime  Time        `json:"user_modified_time,omitempty"`
+	WebContentLink    string      `json:"web_content_link,omitempty"`
+	Writable          bool        `json:"writable,omitempty"`
 }
 
 // FileLinks includes links to file at backend
@@ -232,47 +253,48 @@ type Media struct {
 		VideoType  string `json:"video_type,omitempty"`  // "mpegts"
 		HdrType    string `json:"hdr_type,omitempty"`
 	} `json:"video,omitempty"`
-	Link           *Link         `json:"link,omitempty"`
-	NeedMoreQuota  bool          `json:"need_more_quota,omitempty"`
-	VipTypes       []interface{} `json:"vip_types,omitempty"` // TODO maybe list of something?
-	RedirectLink   string        `json:"redirect_link,omitempty"`
-	IconLink       string        `json:"icon_link,omitempty"`
-	IsDefault      bool          `json:"is_default,omitempty"`
-	Priority       int           `json:"priority,omitempty"`
-	IsOrigin       bool          `json:"is_origin,omitempty"`
-	ResolutionName string        `json:"resolution_name,omitempty"`
-	IsVisible      bool          `json:"is_visible,omitempty"`
-	Category       string        `json:"category,omitempty"`
+	Link           *Link  `json:"link,omitempty"`
+	NeedMoreQuota  bool   `json:"need_more_quota,omitempty"`
+	VipTypes       []any  `json:"vip_types,omitempty"` // TODO maybe list of something?
+	RedirectLink   string `json:"redirect_link,omitempty"`
+	IconLink       string `json:"icon_link,omitempty"`
+	IsDefault      bool   `json:"is_default,omitempty"`
+	Priority       int    `json:"priority,omitempty"`
+	IsOrigin       bool   `json:"is_origin,omitempty"`
+	ResolutionName string `json:"resolution_name,omitempty"`
+	IsVisible      bool   `json:"is_visible,omitempty"`
+	Category       string `json:"category,omitempty"` // "category_origin"
+	Audio          any    `json:"audio"`              // TODO: undiscovered yet
 }
 
 // FileParams includes parameters for instant open
 type FileParams struct {
+	DeviceID     string `json:"device_id,omitempty"`
 	Duration     int64  `json:"duration,omitempty,string"` // in seconds
 	Height       int    `json:"height,omitempty,string"`
 	Platform     string `json:"platform,omitempty"` // "Upload"
 	PlatformIcon string `json:"platform_icon,omitempty"`
+	TaskID       string `json:"task_id"`
 	URL          string `json:"url,omitempty"`
 	Width        int    `json:"width,omitempty,string"`
 }
 
 // FileApp includes parameters for instant open
 type FileApp struct {
-	ID            string        `json:"id,omitempty"`   // "decompress" for rar files
-	Name          string        `json:"name,omitempty"` // decompress" for rar files
-	Access        []interface{} `json:"access,omitempty"`
-	Link          string        `json:"link,omitempty"` // "https://mypikpak.com/drive/decompression/{File.Id}?gcid={File.Hash}\u0026wv-style=topbar%3Ahide"
-	RedirectLink  string        `json:"redirect_link,omitempty"`
-	VipTypes      []interface{} `json:"vip_types,omitempty"`
-	NeedMoreQuota bool          `json:"need_more_quota,omitempty"`
-	IconLink      string        `json:"icon_link,omitempty"`
-	IsDefault     bool          `json:"is_default,omitempty"`
-	Params        struct {
-	} `json:"params,omitempty"` // TODO
-	CategoryIds []interface{} `json:"category_ids,omitempty"`
-	AdSceneType int           `json:"ad_scene_type,omitempty"`
-	Space       string        `json:"space,omitempty"`
-	Links       struct {
-	} `json:"links,omitempty"` // TODO
+	ID            string   `json:"id,omitempty"`   // "decompress" for rar files
+	Name          string   `json:"name,omitempty"` // decompress" for rar files
+	Access        []any    `json:"access,omitempty"`
+	Link          string   `json:"link,omitempty"` // "https://mypikpak.com/drive/decompression/{File.Id}?gcid={File.Hash}\u0026wv-style=topbar%3Ahide"
+	RedirectLink  string   `json:"redirect_link,omitempty"`
+	VipTypes      []any    `json:"vip_types,omitempty"`
+	NeedMoreQuota bool     `json:"need_more_quota,omitempty"`
+	IconLink      string   `json:"icon_link,omitempty"`
+	IsDefault     bool     `json:"is_default,omitempty"`
+	Params        struct{} `json:"params,omitempty"` // TODO
+	CategoryIDs   []any    `json:"category_ids,omitempty"`
+	AdSceneType   int      `json:"ad_scene_type,omitempty"`
+	Space         string   `json:"space,omitempty"`
+	Links         struct{} `json:"links,omitempty"` // TODO
 }
 
 // ------------------------------------------------------------
@@ -286,27 +308,27 @@ type TaskList struct {
 
 // Task is a basic element representing a single task such as offline download and upload
 type Task struct {
-	Kind              string        `json:"kind,omitempty"` // "drive#task"
-	ID                string        `json:"id,omitempty"`   // task id?
-	Name              string        `json:"name,omitempty"` // torrent name?
-	Type              string        `json:"type,omitempty"` // "offline"
-	UserID            string        `json:"user_id,omitempty"`
-	Statuses          []interface{} `json:"statuses,omitempty"`    // TODO
-	StatusSize        int           `json:"status_size,omitempty"` // TODO
-	Params            *TaskParams   `json:"params,omitempty"`      // TODO
-	FileID            string        `json:"file_id,omitempty"`
-	FileName          string        `json:"file_name,omitempty"`
-	FileSize          string        `json:"file_size,omitempty"`
-	Message           string        `json:"message,omitempty"` // e.g. "Saving"
-	CreatedTime       Time          `json:"created_time,omitempty"`
-	UpdatedTime       Time          `json:"updated_time,omitempty"`
-	ThirdTaskID       string        `json:"third_task_id,omitempty"` // TODO
-	Phase             string        `json:"phase,omitempty"`         // e.g. "PHASE_TYPE_RUNNING"
-	Progress          int           `json:"progress,omitempty"`
-	IconLink          string        `json:"icon_link,omitempty"`
-	Callback          string        `json:"callback,omitempty"`
-	ReferenceResource interface{}   `json:"reference_resource,omitempty"` // TODO
-	Space             string        `json:"space,omitempty"`
+	Kind              string      `json:"kind,omitempty"` // "drive#task"
+	ID                string      `json:"id,omitempty"`   // task id?
+	Name              string      `json:"name,omitempty"` // torrent name?
+	Type              string      `json:"type,omitempty"` // "offline"
+	UserID            string      `json:"user_id,omitempty"`
+	Statuses          []any       `json:"statuses,omitempty"`    // TODO
+	StatusSize        int         `json:"status_size,omitempty"` // TODO
+	Params            *TaskParams `json:"params,omitempty"`      // TODO
+	FileID            string      `json:"file_id,omitempty"`
+	FileName          string      `json:"file_name,omitempty"`
+	FileSize          string      `json:"file_size,omitempty"`
+	Message           string      `json:"message,omitempty"` // e.g. "Saving"
+	CreatedTime       Time        `json:"created_time,omitempty"`
+	UpdatedTime       Time        `json:"updated_time,omitempty"`
+	ThirdTaskID       string      `json:"third_task_id,omitempty"` // TODO
+	Phase             string      `json:"phase,omitempty"`         // e.g. "PHASE_TYPE_RUNNING"
+	Progress          int         `json:"progress,omitempty"`
+	IconLink          string      `json:"icon_link,omitempty"`
+	Callback          string      `json:"callback,omitempty"`
+	ReferenceResource any         `json:"reference_resource,omitempty"` // TODO
+	Space             string      `json:"space,omitempty"`
 }
 
 // TaskParams includes parameters informing status of Task
@@ -384,11 +406,10 @@ type NewTask struct {
 
 // About informs drive status
 type About struct {
-	Kind      string `json:"kind,omitempty"` // "drive#about"
-	Quota     *Quota `json:"quota,omitempty"`
-	ExpiresAt string `json:"expires_at,omitempty"`
-	Quotas    struct {
-	} `json:"quotas,omitempty"` // maybe []*Quota?
+	Kind      string   `json:"kind,omitempty"` // "drive#about"
+	Quota     *Quota   `json:"quota,omitempty"`
+	ExpiresAt string   `json:"expires_at,omitempty"`
+	Quotas    struct{} `json:"quotas,omitempty"` // maybe []*Quota?
 }
 
 // Quota informs drive quota
@@ -399,6 +420,7 @@ type Quota struct {
 	UsageInTrash   int64  `json:"usage_in_trash,omitempty,string"` // bytes in trash but this seems not working
 	PlayTimesLimit string `json:"play_times_limit,omitempty"`      // maybe in seconds
 	PlayTimesUsage string `json:"play_times_usage,omitempty"`      // maybe in seconds
+	IsUnlimited    bool   `json:"is_unlimited,omitempty"`
 }
 
 // Share is a response to RequestShare
@@ -462,7 +484,7 @@ type DecompressResult struct {
 
 // RequestShare is to request for file share
 type RequestShare struct {
-	FileIds        []string `json:"file_ids,omitempty"`
+	FileIDs        []string `json:"file_ids,omitempty"`
 	ShareTo        string   `json:"share_to,omitempty"`         // "publiclink",
 	ExpirationDays int      `json:"expiration_days,omitempty"`  // -1 = 'forever'
 	PassCodeOption string   `json:"pass_code_option,omitempty"` // "NOT_REQUIRED"
@@ -470,7 +492,7 @@ type RequestShare struct {
 
 // RequestBatch is to request for batch actions
 type RequestBatch struct {
-	Ids []string          `json:"ids,omitempty"`
+	IDs []string          `json:"ids,omitempty"`
 	To  map[string]string `json:"to,omitempty"`
 }
 
@@ -482,7 +504,7 @@ type RequestNewFile struct {
 	ParentID   string `json:"parent_id"`
 	FolderType string `json:"folder_type"`
 	// only when uploading a new file
-	Hash       string            `json:"hash,omitempty"`      // sha1sum
+	Hash       string            `json:"hash,omitempty"`      // gcid
 	Resumable  map[string]string `json:"resumable,omitempty"` // {"provider": "PROVIDER_ALIYUN"}
 	Size       int64             `json:"size,omitempty"`
 	UploadType string            `json:"upload_type,omitempty"` // "UPLOAD_TYPE_FORM" or "UPLOAD_TYPE_RESUMABLE"
@@ -507,6 +529,72 @@ type RequestDecompress struct {
 	FileID        string           `json:"file_id,omitempty"`
 	Files         []*FileInArchive `json:"files,omitempty"` // can request selected files to be decompressed
 	DefaultParent bool             `json:"default_parent,omitempty"`
+}
+
+// ------------------------------------------------------------ authorization
+
+// CaptchaToken is a response to requestCaptchaToken api call
+type CaptchaToken struct {
+	CaptchaToken string `json:"captcha_token"`
+	ExpiresIn    int64  `json:"expires_in"` // currently 300s
+	// API doesn't provide Expiry field and thus it should be populated from ExpiresIn on retrieval
+	Expiry time.Time `json:"expiry,omitempty"`
+	URL    string    `json:"url,omitempty"` // a link for users to solve captcha
+}
+
+// expired reports whether the token is expired.
+// t must be non-nil.
+func (t *CaptchaToken) expired() bool {
+	if t.Expiry.IsZero() {
+		return false
+	}
+
+	expiryDelta := time.Duration(10) * time.Second // same as oauth2's defaultExpiryDelta
+	return t.Expiry.Round(0).Add(-expiryDelta).Before(time.Now())
+}
+
+// Valid reports whether t is non-nil, has an AccessToken, and is not expired.
+func (t *CaptchaToken) Valid() bool {
+	return t != nil && t.CaptchaToken != "" && !t.expired()
+}
+
+// CaptchaTokenRequest is to request for captcha token
+type CaptchaTokenRequest struct {
+	Action       string            `json:"action,omitempty"`
+	CaptchaToken string            `json:"captcha_token,omitempty"`
+	ClientID     string            `json:"client_id,omitempty"`
+	DeviceID     string            `json:"device_id,omitempty"`
+	Meta         *CaptchaTokenMeta `json:"meta,omitempty"`
+}
+
+// CaptchaTokenMeta contains meta info for CaptchaTokenRequest
+type CaptchaTokenMeta struct {
+	CaptchaSign   string `json:"captcha_sign,omitempty"`
+	ClientVersion string `json:"client_version,omitempty"`
+	PackageName   string `json:"package_name,omitempty"`
+	Timestamp     string `json:"timestamp,omitempty"`
+	UserID        string `json:"user_id,omitempty"` // webdrive uses this instead of UserName
+	UserName      string `json:"username,omitempty"`
+	Email         string `json:"email,omitempty"`
+	PhoneNumber   string `json:"phone_number,omitempty"`
+}
+
+// Token represents oauth2 token used for pikpak which needs to be converted to be compatible with oauth2.Token
+type Token struct {
+	TokenType    string `json:"token_type"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int    `json:"expires_in"`
+	Sub          string `json:"sub"`
+}
+
+// Expiry returns expiry from expires in, so it should be called on retrieval
+// e must be non-nil.
+func (e *Token) Expiry() (t time.Time) {
+	if v := e.ExpiresIn; v != 0 {
+		return time.Now().Add(time.Duration(v) * time.Second)
+	}
+	return
 }
 
 // ------------------------------------------------------------

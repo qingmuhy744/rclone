@@ -1,5 +1,4 @@
 //go:build !plan9
-// +build !plan9
 
 package sftp
 
@@ -32,6 +31,8 @@ func (f *Fs) newSSHClientInternal(ctx context.Context, network, addr string, ssh
 	)
 	if f.opt.SocksProxy != "" {
 		conn, err = proxy.SOCKS5Dial(network, addr, f.opt.SocksProxy, baseDialer)
+	} else if f.proxyURL != nil {
+		conn, err = proxy.HTTPConnectDial(network, addr, f.proxyURL, baseDialer)
 	} else {
 		conn, err = baseDialer.Dial(network, addr)
 	}

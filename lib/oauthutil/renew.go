@@ -1,6 +1,7 @@
 package oauthutil
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/rclone/rclone/fs"
@@ -8,10 +9,12 @@ import (
 
 // Renew allows tokens to be renewed on expiry if uploads are in progress.
 type Renew struct {
-	name    string       // name to use in logs
-	ts      *TokenSource // token source that needs renewing
-	uploads atomic.Int32 // number of uploads in progress
-	run     func() error // a transaction to run to renew the token on
+	name     string       // name to use in logs
+	ts       *TokenSource // token source that needs renewing
+	uploads  atomic.Int32 // number of uploads in progress
+	run      func() error // a transaction to run to renew the token on
+	done     chan any     // channel to end the go routine
+	shutdown sync.Once
 }
 
 // NewRenew creates a new Renew struct and starts a background process
@@ -24,6 +27,7 @@ func NewRenew(name string, ts *TokenSource, run func() error) *Renew {
 		name: name,
 		ts:   ts,
 		run:  run,
+		done: make(chan any),
 	}
 	go r.renewOnExpiry()
 	return r
@@ -36,19 +40,21 @@ func NewRenew(name string, ts *TokenSource, run func() error) *Renew {
 func (r *Renew) renewOnExpiry() {
 	expiry := r.ts.OnExpiry()
 	for {
-		<-expiry
+		select {
+		case <-expiry:
+		case <-r.done:
+			return
+		}
 		uploads := r.uploads.Load()
 		if uploads != 0 {
-			fs.Debugf(r.name, "Token expired - %d uploads in progress - refreshing", uploads)
+			fs.Debugf(r.name, "Background refresher detected expired token - %d uploads in progress - refreshing", uploads)
 			// Do a transaction
 			err := r.run()
-			if err == nil {
-				fs.Debugf(r.name, "Token refresh successful")
-			} else {
-				fs.Errorf(r.name, "Token refresh failed: %v", err)
+			if err != nil {
+				fs.Errorf(r.name, "Background token refresher failed: %v", err)
 			}
 		} else {
-			fs.Debugf(r.name, "Token expired but no uploads in progress - doing nothing")
+			fs.Debugf(r.name, "Background refresher detected expired token but no uploads in progress - doing nothing")
 		}
 	}
 }
@@ -71,4 +77,18 @@ func (r *Renew) Invalidate() {
 // Expire expires the token source
 func (r *Renew) Expire() error {
 	return r.ts.Expire()
+}
+
+// Shutdown stops the timer and no more renewal will take place.
+func (r *Renew) Shutdown() {
+	if r == nil {
+		return
+	}
+	// closing a channel can only be done once
+	r.shutdown.Do(func() {
+		if r.ts != nil {
+			r.ts.expiryTimer.Stop()
+		}
+		close(r.done)
+	})
 }

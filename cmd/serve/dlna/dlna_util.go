@@ -1,11 +1,12 @@
 package dlna
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/xml"
 	"fmt"
 	"io"
-	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -31,7 +32,7 @@ func makeDefaultFriendlyName() string {
 func makeDeviceUUID(unique string) string {
 	h := md5.New()
 	if _, err := io.WriteString(h, unique); err != nil {
-		log.Panicf("makeDeviceUUID write failed: %s", err)
+		fs.Panicf(nil, "makeDeviceUUID write failed: %s", err)
 	}
 	buf := h.Sum(nil)
 	return upnp.FormatUUID(buf)
@@ -41,7 +42,7 @@ func makeDeviceUUID(unique string) string {
 func listInterfaces() []net.Interface {
 	ifs, err := net.Interfaces()
 	if err != nil {
-		log.Printf("list network interfaces: %v", err)
+		fs.Logf(nil, "list network interfaces: %v", err)
 		return []net.Interface{}
 	}
 
@@ -68,10 +69,10 @@ func didlLite(chardata string) string {
 		`</DIDL-Lite>`
 }
 
-func mustMarshalXML(value interface{}) []byte {
+func mustMarshalXML(value any) []byte {
 	ret, err := xml.MarshalIndent(value, "", "  ")
 	if err != nil {
-		log.Panicf("mustMarshalXML failed to marshal %v: %s", value, err)
+		fs.Panicf(nil, "mustMarshalXML failed to marshal %v: %s", value, err)
 	}
 	return ret
 }
@@ -85,8 +86,8 @@ func marshalSOAPResponse(sa upnp.SoapAction, args map[string]string) []byte {
 			Value:   value,
 		})
 	}
-	return []byte(fmt.Sprintf(`<u:%[1]sResponse xmlns:u="%[2]s">%[3]s</u:%[1]sResponse>`,
-		sa.Action, sa.ServiceURN.String(), mustMarshalXML(soapArgs)))
+	return fmt.Appendf(nil, `<u:%[1]sResponse xmlns:u="%[2]s">%[3]s</u:%[1]sResponse>`,
+		sa.Action, sa.ServiceURN.String(), mustMarshalXML(soapArgs))
 }
 
 type loggingResponseWriter struct {
@@ -95,7 +96,7 @@ type loggingResponseWriter struct {
 	committed bool
 }
 
-func (lrw *loggingResponseWriter) logRequest(code int, err interface{}) {
+func (lrw *loggingResponseWriter) logRequest(code int, err any) {
 	// Choose appropriate log level based on response status code.
 	var level fs.LogLevel
 	if code < 400 && err == nil {
@@ -108,7 +109,7 @@ func (lrw *loggingResponseWriter) logRequest(code int, err interface{}) {
 		err = ""
 	}
 
-	fs.LogPrintf(level, lrw.request.URL, "%s %s %d %s %s",
+	fs.LogLevelPrintf(level, lrw.request.URL, "%s %s %d %s %s",
 		lrw.request.RemoteAddr, lrw.request.Method, code,
 		lrw.request.Header.Get("SOAPACTION"), err)
 }
@@ -143,9 +144,10 @@ func logging(next http.Handler) http.Handler {
 // Error recovery and general request logging are left to logging().
 func traceLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
 		dump, err := httputil.DumpRequest(r, true)
 		if err != nil {
-			serveError(nil, w, "error dumping request", err)
+			serveError(ctx, nil, w, "error dumping request", err)
 			return
 		}
 		fs.Debugf(nil, "%s", dump)
@@ -162,9 +164,7 @@ func traceLogging(next http.Handler) http.Handler {
 		}
 
 		// copy from recorder to the real response writer
-		for k, v := range recorder.Header() {
-			w.Header()[k] = v
-		}
+		maps.Copy(w.Header(), recorder.Header())
 		w.WriteHeader(recorder.Code)
 		_, err = recorder.Body.WriteTo(w)
 		if err != nil {
@@ -183,8 +183,8 @@ func withHeader(name string, value string, next http.Handler) http.Handler {
 }
 
 // serveError returns an http.StatusInternalServerError and logs the error
-func serveError(what interface{}, w http.ResponseWriter, text string, err error) {
-	err = fs.CountError(err)
+func serveError(ctx context.Context, what any, w http.ResponseWriter, text string, err error) {
+	err = fs.CountError(ctx, err)
 	fs.Errorf(what, "%s: %v", text, err)
 	http.Error(w, text+".", http.StatusInternalServerError)
 }

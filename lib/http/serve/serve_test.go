@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/stretchr/testify/assert"
 )
@@ -76,7 +78,29 @@ func TestObjectBadRange(t *testing.T) {
 	Object(w, r, o)
 	resp := w.Result()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	assert.Equal(t, "10", resp.Header.Get("Content-Length"))
+	if contentLength := resp.Header.Get("Content-Length"); contentLength != "" {
+		assert.Equal(t, "10", contentLength)
+	}
 	body, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, "Bad Request\n", string(body))
+}
+
+func TestObjectHEADMetadata(t *testing.T) {
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("HEAD", "http://example.com/aFile", nil)
+	m := fs.Metadata{
+		"content-disposition": "inline",
+		"cache-control":       "no-cache",
+		"content-language":    "en",
+		"content-encoding":    "gzip",
+	}
+	o := object.NewMemoryObject("aFile", time.Now(), []byte("")).
+		WithMetadata(m).WithMimeType("text/plain; charset=utf-8")
+	Object(w, r, o)
+	resp := w.Result()
+	assert.Equal(t, "text/plain; charset=utf-8", resp.Header.Get("Content-Type"))
+	assert.Equal(t, "inline", resp.Header.Get("Content-Disposition"))
+	assert.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
+	assert.Equal(t, "en", resp.Header.Get("Content-Language"))
+	assert.Equal(t, "gzip", resp.Header.Get("Content-Encoding"))
 }

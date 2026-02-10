@@ -28,13 +28,11 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
-	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/lib/batcher"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
-	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
 
@@ -45,6 +43,7 @@ var (
 	errAlbumDelete = errors.New("google photos API does not implement deleting albums")
 	errRemove      = errors.New("google photos API only implements removing files from albums")
 	errOwnAlbums   = errors.New("google photos API only allows uploading to albums rclone created")
+	errReadOnly    = errors.New("can't upload files in read only mode")
 )
 
 const (
@@ -54,20 +53,33 @@ const (
 	listChunks                  = 100 // chunk size to read directory listings
 	albumChunks                 = 50  // chunk size to read album listings
 	minSleep                    = 10 * time.Millisecond
-	scopeReadOnly               = "https://www.googleapis.com/auth/photoslibrary.readonly"
-	scopeReadWrite              = "https://www.googleapis.com/auth/photoslibrary"
-	scopeAccess                 = 2 // position of access scope in list
+	scopeAppendOnly             = "https://www.googleapis.com/auth/photoslibrary.appendonly"
+	scopeReadOnly               = "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata"
+	scopeReadWrite              = "https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata"
 )
 
 var (
+	// scopes needed for read write access
+	scopesReadWrite = []string{
+		"openid",
+		"profile",
+		scopeAppendOnly,
+		scopeReadOnly,
+		scopeReadWrite,
+	}
+
+	// scopes needed for read only access
+	scopesReadOnly = []string{
+		"openid",
+		"profile",
+		scopeReadOnly,
+	}
+
 	// Description of how to auth for this app
-	oauthConfig = &oauth2.Config{
-		Scopes: []string{
-			"openid",
-			"profile",
-			scopeReadWrite, // this must be at position scopeAccess
-		},
-		Endpoint:     google.Endpoint,
+	oauthConfig = &oauthutil.Config{
+		Scopes:       scopesReadWrite,
+		AuthURL:      google.Endpoint.AuthURL,
+		TokenURL:     google.Endpoint.TokenURL,
 		ClientID:     rcloneClientID,
 		ClientSecret: obscure.MustReveal(rcloneEncryptedClientSecret),
 		RedirectURL:  oauthutil.RedirectURL,
@@ -101,20 +113,26 @@ func init() {
 			case "":
 				// Fill in the scopes
 				if opt.ReadOnly {
-					oauthConfig.Scopes[scopeAccess] = scopeReadOnly
+					oauthConfig.Scopes = scopesReadOnly
 				} else {
-					oauthConfig.Scopes[scopeAccess] = scopeReadWrite
+					oauthConfig.Scopes = scopesReadWrite
 				}
-				return oauthutil.ConfigOut("warning", &oauthutil.Options{
+				return oauthutil.ConfigOut("warning1", &oauthutil.Options{
 					OAuth2Config: oauthConfig,
 				})
-			case "warning":
+			case "warning1":
 				// Warn the user as required by google photos integration
-				return fs.ConfigConfirm("warning_done", true, "config_warning", `Warning
+				return fs.ConfigConfirm("warning2", true, "config_warning", `Warning
 
 IMPORTANT: All media items uploaded to Google Photos with rclone
 are stored in full resolution at original quality.  These uploads
 will count towards storage in your Google Account.`)
+
+			case "warning2":
+				// Warn the user that rclone can no longer download photos it didnt upload from google photos
+				return fs.ConfigConfirm("warning_done", true, "config_warning", `Warning
+IMPORTANT: Due to Google policy changes rclone can now only download photos it uploaded.`)
+
 			case "warning_done":
 				return nil, nil
 			}
@@ -161,6 +179,34 @@ Without this flag, archived media will not be visible in directory
 listings and won't be transferred.`,
 			Advanced: true,
 		}, {
+			Name:    "proxy",
+			Default: "",
+			Help: strings.ReplaceAll(`Use the gphotosdl proxy for downloading the full resolution images
+
+The Google API will deliver images and video which aren't full
+resolution, and/or have EXIF data missing.
+
+However if you use the gphotosdl proxy then you can download original,
+unchanged images.
+
+This runs a headless browser in the background.
+
+Download the software from [gphotosdl](https://github.com/rclone/gphotosdl)
+
+First run with
+
+    gphotosdl -login
+
+Then once you have logged into google photos close the browser window
+and run
+
+    gphotosdl
+
+Then supply the parameter |--gphotos-proxy "http://localhost:8282"| to make
+rclone use the proxy.
+`, "|", "`"),
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -181,6 +227,7 @@ type Options struct {
 	BatchMode       string               `config:"batch_mode"`
 	BatchSize       int                  `config:"batch_size"`
 	BatchTimeout    fs.Duration          `config:"batch_timeout"`
+	Proxy           string               `config:"proxy"`
 }
 
 // Fs represents a remote storage server
@@ -280,7 +327,7 @@ func errorHandler(resp *http.Response) error {
 	if strings.HasPrefix(resp.Header.Get("Content-Type"), "image/") {
 		body = []byte("Image not found or broken")
 	}
-	var e = api.Error{
+	e := api.Error{
 		Details: api.ErrorDetails{
 			Code:    resp.StatusCode,
 			Message: string(body),
@@ -305,7 +352,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	baseClient := fshttp.NewClient(ctx)
 	oAuthClient, ts, err := oauthutil.NewClientWithBaseClient(ctx, name, m, oauthConfig, baseClient)
 	if err != nil {
-		return nil, fmt.Errorf("failed to configure Box: %w", err)
+		return nil, fmt.Errorf("failed to configure google photos: %w", err)
 	}
 
 	root = strings.Trim(path.Clean(root), "/")
@@ -360,7 +407,7 @@ func (f *Fs) fetchEndpoint(ctx context.Context, name string) (endpoint string, e
 		Method:  "GET",
 		RootURL: "https://accounts.google.com/.well-known/openid-configuration",
 	}
-	var openIDconfig map[string]interface{}
+	var openIDconfig map[string]any
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err := f.unAuth.CallJSON(ctx, &opts, nil, &openIDconfig)
 		return shouldRetry(ctx, resp, err)
@@ -420,7 +467,7 @@ func (f *Fs) Disconnect(ctx context.Context) (err error) {
 			"token_type_hint": []string{"access_token"},
 		},
 	}
-	var res interface{}
+	var res any
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err := f.srv.CallJSON(ctx, &opts, nil, &res)
 		return shouldRetry(ctx, resp, err)
@@ -454,7 +501,7 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Med
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error fs.ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	defer log.Trace(f, "remote=%q", remote)("")
+	// defer log.Trace(f, "remote=%q", remote)("")
 	return f.newObjectWithInfo(ctx, remote, nil)
 }
 
@@ -620,9 +667,7 @@ func (f *Fs) listDir(ctx context.Context, prefix string, filter api.SearchFilter
 		if err != nil {
 			return err
 		}
-		if entry != nil {
-			entries = append(entries, entry)
-		}
+		entries = append(entries, entry)
 		return nil
 	})
 	if err != nil {
@@ -669,7 +714,7 @@ func (f *Fs) listUploads(ctx context.Context, dir string) (entries fs.DirEntries
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	defer log.Trace(f, "dir=%q", dir)("err=%v", &err)
+	// defer log.Trace(f, "dir=%q", dir)("err=%v", &err)
 	match, prefix, pattern := patterns.match(f.root, dir, false)
 	if pattern == nil || pattern.isFile {
 		return nil, fs.ErrorDirNotFound
@@ -686,7 +731,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 //
 // The new object may have been created if an error is returned
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	defer log.Trace(f, "src=%+v", src)("")
+	// defer log.Trace(f, "src=%+v", src)("")
 	// Temporary Object under construction
 	o := &Object{
 		fs:     f,
@@ -702,7 +747,7 @@ func (f *Fs) createAlbum(ctx context.Context, albumTitle string) (album *api.Alb
 		Path:       "/albums",
 		Parameters: url.Values{},
 	}
-	var request = api.CreateAlbum{
+	request := api.CreateAlbum{
 		Album: &api.Album{
 			Title: albumTitle,
 		},
@@ -739,7 +784,7 @@ func (f *Fs) getOrCreateAlbum(ctx context.Context, albumTitle string) (album *ap
 
 // Mkdir creates the album if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) (err error) {
-	defer log.Trace(f, "dir=%q", dir)("err=%v", &err)
+	// defer log.Trace(f, "dir=%q", dir)("err=%v", &err)
 	match, prefix, pattern := patterns.match(f.root, dir, false)
 	if pattern == nil {
 		return fs.ErrorDirNotFound
@@ -763,7 +808,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) (err error) {
 //
 // Returns an error if it isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) (err error) {
-	defer log.Trace(f, "dir=%q")("err=%v", &err)
+	// defer log.Trace(f, "dir=%q")("err=%v", &err)
 	match, _, pattern := patterns.match(f.root, dir, false)
 	if pattern == nil {
 		return fs.ErrorDirNotFound
@@ -836,7 +881,7 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 
 // Size returns the size of an object in bytes
 func (o *Object) Size() int64 {
-	defer log.Trace(o, "")("")
+	// defer log.Trace(o, "")("")
 	if !o.fs.opt.ReadSize || o.bytes >= 0 {
 		return o.bytes
 	}
@@ -937,7 +982,7 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 // It attempts to read the objects mtime and if that isn't present the
 // LastModified returned in the http headers
 func (o *Object) ModTime(ctx context.Context) time.Time {
-	defer log.Trace(o, "")("")
+	// defer log.Trace(o, "")("")
 	err := o.readMetaData(ctx)
 	if err != nil {
 		fs.Debugf(o, "ModTime: Failed to read metadata: %v", err)
@@ -967,16 +1012,20 @@ func (o *Object) downloadURL() string {
 
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
-	defer log.Trace(o, "")("")
+	// defer log.Trace(o, "")("")
 	err = o.readMetaData(ctx)
 	if err != nil {
 		fs.Debugf(o, "Open: Failed to read metadata: %v", err)
 		return nil, err
 	}
+	url := o.downloadURL()
+	if o.fs.opt.Proxy != "" {
+		url = strings.TrimRight(o.fs.opt.Proxy, "/") + "/id/" + o.id
+	}
 	var resp *http.Response
 	opts := rest.Opts{
 		Method:  "GET",
-		RootURL: o.downloadURL(),
+		RootURL: url,
 		Options: options,
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
@@ -1002,7 +1051,7 @@ func (f *Fs) commitBatchAlbumID(ctx context.Context, items []uploadedItem, resul
 		Method: "POST",
 		Path:   "/mediaItems:batchCreate",
 	}
-	var request = api.BatchCreateRequest{
+	request := api.BatchCreateRequest{
 		AlbumID: albumID,
 	}
 	itemsInBatch := 0
@@ -1069,7 +1118,7 @@ func (f *Fs) commitBatch(ctx context.Context, items []uploadedItem, results []*a
 //
 // The new object may have been created if an error is returned
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
-	defer log.Trace(o, "src=%+v", src)("err=%v", &err)
+	// defer log.Trace(o, "src=%+v", src)("err=%v", &err)
 	match, _, pattern := patterns.match(o.fs.root, o.remote, true)
 	if pattern == nil || !pattern.isFile || !pattern.canUpload {
 		return errCantUpload
@@ -1090,6 +1139,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 
 		if !album.IsWriteable {
+			if o.fs.opt.ReadOnly {
+				return errReadOnly
+			}
 			return errOwnAlbums
 		}
 
@@ -1138,10 +1190,13 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		errors := make([]error, 1)
 		results := make([]*api.MediaItem, 1)
 		err = o.fs.commitBatch(ctx, []uploadedItem{uploaded}, results, errors)
-		if err != nil {
+		if err == nil {
 			err = errors[0]
 			info = results[0]
 		}
+	}
+	if err != nil {
+		return fmt.Errorf("failed to commit batch: %w", err)
 	}
 
 	o.setMetaData(info)
@@ -1171,8 +1226,8 @@ func (o *Object) Remove(ctx context.Context) (err error) {
 		Path:       "/albums/" + album.ID + ":batchRemoveMediaItems",
 		NoResponse: true,
 	}
-	var request = api.BatchRemoveItems{
-		MediaItemIds: []string{o.id},
+	request := api.BatchRemoveItems{
+		MediaItemIDs: []string{o.id},
 	}
 	var resp *http.Response
 	err = o.fs.pacer.Call(func() (bool, error) {

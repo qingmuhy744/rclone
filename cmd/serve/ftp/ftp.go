@@ -1,5 +1,4 @@
 //go:build !plan9
-// +build !plan9
 
 // Package ftp implements an FTP server for rclone
 package ftp
@@ -15,73 +14,114 @@ import (
 	"os/user"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/cmd/serve"
 	"github.com/rclone/rclone/cmd/serve/proxy"
 	"github.com/rclone/rclone/cmd/serve/proxy/proxyflags"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/vfs"
+	"github.com/rclone/rclone/vfs/vfscommon"
 	"github.com/rclone/rclone/vfs/vfsflags"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	ftp "goftp.io/server/v2"
 )
 
+// OptionsInfo descripts the Options in use
+var OptionsInfo = fs.Options{{
+	Name:    "addr",
+	Default: "localhost:2121",
+	Help:    "IPaddress:Port or :Port to bind server to",
+}, {
+	Name:    "public_ip",
+	Default: "",
+	Help:    "Public IP address to advertise for passive connections",
+}, {
+	Name:    "passive_port",
+	Default: "30000-32000",
+	Help:    "Passive port range to use",
+}, {
+	Name:    "user",
+	Default: "anonymous",
+	Help:    "User name for authentication",
+}, {
+	Name:    "pass",
+	Default: "",
+	Help:    "Password for authentication (empty value allow every password)",
+}, {
+	Name:    "cert",
+	Default: "",
+	Help:    "TLS PEM key (concatenation of certificate and CA certificate)",
+}, {
+	Name:    "key",
+	Default: "",
+	Help:    "TLS PEM Private key",
+}}
+
 // Options contains options for the http Server
 type Options struct {
 	//TODO add more options
-	ListenAddr   string // Port to listen on
-	PublicIP     string // Passive ports range
-	PassivePorts string // Passive ports range
-	BasicUser    string // single username for basic auth if not using Htpasswd
-	BasicPass    string // password for BasicUser
-	TLSCert      string // TLS PEM key (concatenation of certificate and CA certificate)
-	TLSKey       string // TLS PEM Private key
-}
-
-// DefaultOpt is the default values used for Options
-var DefaultOpt = Options{
-	ListenAddr:   "localhost:2121",
-	PublicIP:     "",
-	PassivePorts: "30000-32000",
-	BasicUser:    "anonymous",
-	BasicPass:    "",
+	ListenAddr   string `config:"addr"`         // Port to listen on
+	PublicIP     string `config:"public_ip"`    // Passive ports range
+	PassivePorts string `config:"passive_port"` // Passive ports range
+	User         string `config:"user"`         // single username for basic auth if not using Htpasswd
+	Pass         string `config:"pass"`         // password for User
+	TLSCert      string `config:"cert"`         // TLS PEM key (concatenation of certificate and CA certificate)
+	TLSKey       string `config:"key"`          // TLS PEM Private key
 }
 
 // Opt is options set by command line flags
-var Opt = DefaultOpt
+var Opt Options
 
 // AddFlags adds flags for ftp
 func AddFlags(flagSet *pflag.FlagSet) {
-	rc.AddOption("ftp", &Opt)
-	flags.StringVarP(flagSet, &Opt.ListenAddr, "addr", "", Opt.ListenAddr, "IPaddress:Port or :Port to bind server to", "")
-	flags.StringVarP(flagSet, &Opt.PublicIP, "public-ip", "", Opt.PublicIP, "Public IP address to advertise for passive connections", "")
-	flags.StringVarP(flagSet, &Opt.PassivePorts, "passive-port", "", Opt.PassivePorts, "Passive port range to use", "")
-	flags.StringVarP(flagSet, &Opt.BasicUser, "user", "", Opt.BasicUser, "User name for authentication", "")
-	flags.StringVarP(flagSet, &Opt.BasicPass, "pass", "", Opt.BasicPass, "Password for authentication (empty value allow every password)", "")
-	flags.StringVarP(flagSet, &Opt.TLSCert, "cert", "", Opt.TLSCert, "TLS PEM key (concatenation of certificate and CA certificate)", "")
-	flags.StringVarP(flagSet, &Opt.TLSKey, "key", "", Opt.TLSKey, "TLS PEM Private key", "")
+	flags.AddFlagsFromOptions(flagSet, "", OptionsInfo)
 }
 
 func init() {
 	vfsflags.AddFlags(Command.Flags())
 	proxyflags.AddFlags(Command.Flags())
 	AddFlags(Command.Flags())
+	serve.Command.AddCommand(Command)
+	serve.AddRc("ftp", func(ctx context.Context, f fs.Fs, in rc.Params) (serve.Handle, error) {
+		// Read VFS Opts
+		var vfsOpt = vfscommon.Opt // set default opts
+		err := configstruct.SetAny(in, &vfsOpt)
+		if err != nil {
+			return nil, err
+		}
+		// Read Proxy Opts
+		var proxyOpt = proxy.Opt // set default opts
+		err = configstruct.SetAny(in, &proxyOpt)
+		if err != nil {
+			return nil, err
+		}
+		// Read opts
+		var opt = Opt // set default opts
+		err = configstruct.SetAny(in, &opt)
+		if err != nil {
+			return nil, err
+		}
+		// Create server
+		return newServer(ctx, f, &opt, &vfsOpt, &proxyOpt)
+	})
 }
 
 // Command definition for cobra
 var Command = &cobra.Command{
 	Use:   "ftp remote:path",
 	Short: `Serve remote:path over FTP.`,
-	Long: `
-Run a basic FTP server to serve a remote over FTP protocol.
+	Long: `Run a basic FTP server to serve a remote over FTP protocol.
 This can be viewed with a FTP client or you can make a remote of
 type FTP to read and write it.
 
@@ -100,25 +140,26 @@ then using Authentication is advised - see the next section for info.
 By default this will serve files without needing a login.
 
 You can set a single username and password with the --user and --pass flags.
-` + vfs.Help + proxy.Help,
+
+` + strings.TrimSpace(vfs.Help()+proxy.Help),
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.44",
 		"groups":            "Filter",
 	},
 	Run: func(command *cobra.Command, args []string) {
 		var f fs.Fs
-		if proxyflags.Opt.AuthProxy == "" {
+		if proxy.Opt.AuthProxy == "" {
 			cmd.CheckArgs(1, 1, command, args)
 			f = cmd.NewFsSrc(args)
 		} else {
 			cmd.CheckArgs(0, 0, command, args)
 		}
 		cmd.Run(false, false, command, func() error {
-			s, err := newServer(context.Background(), f, &Opt)
+			s, err := newServer(context.Background(), f, &Opt, &vfscommon.Opt, &proxy.Opt)
 			if err != nil {
 				return err
 			}
-			return s.serve()
+			return s.Serve()
 		})
 	},
 }
@@ -136,17 +177,21 @@ type driver struct {
 	userPass   map[string]string // cache of username => password when using vfs proxy
 }
 
+func init() {
+	fs.RegisterGlobalOptions(fs.OptionsInfo{Name: "ftp", Opt: &Opt, Options: OptionsInfo})
+}
+
 var passivePortsRe = regexp.MustCompile(`^\s*\d+\s*-\s*\d+\s*$`)
 
 // Make a new FTP to serve the remote
-func newServer(ctx context.Context, f fs.Fs, opt *Options) (*driver, error) {
+func newServer(ctx context.Context, f fs.Fs, opt *Options, vfsOpt *vfscommon.Options, proxyOpt *proxy.Options) (*driver, error) {
 	host, port, err := net.SplitHostPort(opt.ListenAddr)
 	if err != nil {
-		return nil, errors.New("failed to parse host:port")
+		return nil, fmt.Errorf("failed to parse host:port from %q", opt.ListenAddr)
 	}
 	portNum, err := strconv.Atoi(port)
 	if err != nil {
-		return nil, errors.New("failed to parse host:port")
+		return nil, fmt.Errorf("failed to parse port number from %q", port)
 	}
 
 	d := &driver{
@@ -154,11 +199,11 @@ func newServer(ctx context.Context, f fs.Fs, opt *Options) (*driver, error) {
 		ctx: ctx,
 		opt: *opt,
 	}
-	if proxyflags.Opt.AuthProxy != "" {
-		d.proxy = proxy.New(ctx, &proxyflags.Opt)
+	if proxy.Opt.AuthProxy != "" {
+		d.proxy = proxy.New(ctx, proxyOpt, vfsOpt)
 		d.userPass = make(map[string]string, 16)
 	} else {
-		d.globalVFS = vfs.New(f, &vfsflags.Opt)
+		d.globalVFS = vfs.New(f, vfsOpt)
 	}
 	d.useTLS = d.opt.TLSKey != ""
 
@@ -190,30 +235,68 @@ func newServer(ctx context.Context, f fs.Fs, opt *Options) (*driver, error) {
 	return d, nil
 }
 
-// serve runs the ftp server
-func (d *driver) serve() error {
+// Serve runs the FTP server until it is shutdown
+func (d *driver) Serve() error {
 	fs.Logf(d.f, "Serving FTP on %s", d.srv.Hostname+":"+strconv.Itoa(d.srv.Port))
-	return d.srv.ListenAndServe()
+	err := d.srv.ListenAndServe()
+	if err == ftp.ErrServerClosed {
+		err = nil
+	}
+	return err
 }
 
-// close stops the ftp server
+// Shutdown stops the ftp server
 //
 //lint:ignore U1000 unused when not building linux
-func (d *driver) close() error {
+func (d *driver) Shutdown() error {
 	fs.Logf(d.f, "Stopping FTP on %s", d.srv.Hostname+":"+strconv.Itoa(d.srv.Port))
 	return d.srv.Shutdown()
+}
+
+// Return the first address of the server
+func (d *driver) Addr() net.Addr {
+	// The FTP server doesn't let us read the listener
+	// so we have to synthesize the net.Addr here.
+	// On errors we'll return a zero item or zero parts.
+	addr := &net.TCPAddr{}
+
+	// Split host and port
+	host, port, err := net.SplitHostPort(d.opt.ListenAddr)
+	if err != nil {
+		fs.Errorf(nil, "ftp: addr: invalid address format: %v", err)
+		return addr
+	}
+
+	// Parse port
+	addr.Port, err = strconv.Atoi(port)
+	if err != nil {
+		fs.Errorf(nil, "ftp: addr: invalid port number: %v", err)
+	}
+
+	// Resolve the host to an IP address.
+	ipAddrs, err := net.LookupIP(host)
+	if err != nil {
+		fs.Errorf(nil, "ftp: addr: failed to resolve host: %v", err)
+	} else if len(ipAddrs) == 0 {
+		fs.Errorf(nil, "ftp: addr: no IP addresses found for host: %s", host)
+	} else {
+		// Choose the first IP address.
+		addr.IP = ipAddrs[0]
+	}
+
+	return addr
 }
 
 // Logger ftp logger output formatted message
 type Logger struct{}
 
 // Print log simple text message
-func (l *Logger) Print(sessionID string, message interface{}) {
+func (l *Logger) Print(sessionID string, message any) {
 	fs.Infof(sessionID, "%s", message)
 }
 
 // Printf log formatted text message
-func (l *Logger) Printf(sessionID string, format string, v ...interface{}) {
+func (l *Logger) Printf(sessionID string, format string, v ...any) {
 	fs.Infof(sessionID, format, v...)
 }
 
@@ -251,7 +334,7 @@ func (d *driver) CheckPasswd(sctx *ftp.Context, user, pass string) (ok bool, err
 		d.userPass[user] = oPass
 		d.userPassMu.Unlock()
 	} else {
-		ok = d.opt.BasicUser == user && (d.opt.BasicPass == "" || d.opt.BasicPass == pass)
+		ok = d.opt.User == user && (d.opt.Pass == "" || d.opt.Pass == pass)
 		if !ok {
 			fs.Infof(nil, "login failed: bad credentials")
 			return false, nil
@@ -339,7 +422,7 @@ func (d *driver) ListDir(sctx *ftp.Context, path string, callback func(iofs.File
 	}
 
 	// Account the transfer
-	tr := accounting.GlobalStats().NewTransferRemoteSize(path, node.Size())
+	tr := accounting.GlobalStats().NewTransferRemoteSize(path, node.Size(), d.f, nil)
 	defer func() {
 		tr.Done(d.ctx, err)
 	}()
@@ -448,7 +531,7 @@ func (d *driver) GetFile(sctx *ftp.Context, path string, offset int64) (size int
 	}
 
 	// Account the transfer
-	tr := accounting.GlobalStats().NewTransferRemoteSize(path, node.Size())
+	tr := accounting.GlobalStats().NewTransferRemoteSize(path, node.Size(), d.f, nil)
 	defer tr.Done(d.ctx, nil)
 
 	return node.Size(), handle, nil

@@ -20,8 +20,7 @@ func init() {
 var commandDefinition = &cobra.Command{
 	Use:   "md5sum remote:path",
 	Short: `Produces an md5sum file for all the objects in the path.`,
-	Long: `
-Produces an md5sum file for all the objects in the path.  This
+	Long: `Produces an md5sum file for all the objects in the path.  This
 is in the same format as the standard md5sum tool produces.
 
 By default, the hash is requested from the remote.  If MD5 is
@@ -36,8 +35,7 @@ to running ` + "`rclone hashsum MD5 remote:path`" + `.
 This command can also hash data received on standard input (stdin),
 by not passing a remote:path, or by passing a hyphen as remote:path
 when there is data to read (if not, the hyphen will be treated literally,
-as a relative path).
-`,
+as a relative path).`,
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.02",
 		"groups":            "Filter,Listing",

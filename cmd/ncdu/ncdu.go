@@ -1,5 +1,4 @@
-//go:build !plan9 && !js
-// +build !plan9,!js
+//go:build !plan9 && !js && !aix
 
 // Package ncdu implements a text based user interface for exploring a remote
 package ncdu
@@ -7,6 +6,8 @@ package ncdu
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"os"
 	"path"
 	"reflect"
 	"sort"
@@ -32,8 +33,7 @@ func init() {
 var commandDefinition = &cobra.Command{
 	Use:   "ncdu remote:path",
 	Short: `Explore a remote with a text based user interface.`,
-	Long: `
-This displays a text based user interface allowing the navigation of a
+	Long: `This displays a text based user interface allowing the navigation of a
 remote. It is most useful for answering the question - "What is using
 all my disk space?".
 
@@ -47,34 +47,37 @@ structure as it goes along.
 You can interact with the user interface using key presses,
 press '?' to toggle the help on and off. The supported keys are:
 
-    ` + strings.Join(helpText()[1:], "\n    ") + `
+` + "```text" + `
+` + strings.Join(helpText()[1:], "\n") + `
+` + "```" + `
 
 Listed files/directories may be prefixed by a one-character flag,
 some of them combined with a description in brackets at end of line.
 These flags have the following meaning:
 
-    e means this is an empty directory, i.e. contains no files (but
-      may contain empty subdirectories)
-    ~ means this is a directory where some of the files (possibly in
-      subdirectories) have unknown size, and therefore the directory
-      size may be underestimated (and average size inaccurate, as it
-      is average of the files with known sizes).
-    . means an error occurred while reading a subdirectory, and
-      therefore the directory size may be underestimated (and average
-      size inaccurate)
-    ! means an error occurred while reading this directory
+` + "```text" + `
+e means this is an empty directory, i.e. contains no files (but
+  may contain empty subdirectories)
+~ means this is a directory where some of the files (possibly in
+  subdirectories) have unknown size, and therefore the directory
+  size may be underestimated (and average size inaccurate, as it
+  is average of the files with known sizes).
+. means an error occurred while reading a subdirectory, and
+  therefore the directory size may be underestimated (and average
+  size inaccurate)
+! means an error occurred while reading this directory
+` + "```" + `
 
 This an homage to the [ncdu tool](https://dev.yorhel.nl/ncdu) but for
 rclone remotes.  It is missing lots of features at the moment
-but is useful as it stands.
+but is useful as it stands. Unlike ncdu it does not show excluded files.
 
 Note that it might take some time to delete big files/directories. The
 UI won't respond in the meantime since the deletion is done synchronously.
 
 For a non-interactive listing of the remote, see the
 [tree](/commands/rclone_tree/) command. To just get the total size of
-the remote you can also use the [size](/commands/rclone_size/) command.
-`,
+the remote you can also use the [size](/commands/rclone_size/) command.`,
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.37",
 		"groups":            "Filter,Listing",
@@ -114,7 +117,8 @@ func helpText() (tr []string) {
 		" ^L refresh screen (fix screen corruption)",
 		" r recalculate file sizes",
 		" ? to toggle help on and off",
-		" q/ESC/^c to quit",
+		" ESC to close the menu box",
+		" q/^c to quit",
 	}...)
 	return
 }
@@ -186,7 +190,7 @@ func (u *UI) Print(x, y int, style tcell.Style, msg string) {
 }
 
 // Printf a string
-func (u *UI) Printf(x, y int, style tcell.Style, format string, args ...interface{}) {
+func (u *UI) Printf(x, y int, style tcell.Style, format string, args ...any) {
 	s := fmt.Sprintf(format, args...)
 	u.Print(x, y, style, s)
 }
@@ -208,7 +212,7 @@ func (u *UI) Line(x, y, xmax int, style tcell.Style, spacer rune, msg string) {
 }
 
 // Linef a string
-func (u *UI) Linef(x, y, xmax int, style tcell.Style, spacer rune, format string, args ...interface{}) {
+func (u *UI) Linef(x, y, xmax int, style tcell.Style, spacer rune, format string, args ...any) {
 	s := fmt.Sprintf(format, args...)
 	u.Line(x, y, xmax, style, spacer, s)
 }
@@ -274,11 +278,7 @@ func (u *UI) Box() {
 	xmax := x + boxWidth
 	if len(u.boxMenu) != 0 {
 		count := lineOptionLength(u.boxMenu)
-		if x+boxWidth > x+count {
-			xmax = x + boxWidth
-		} else {
-			xmax = x + count
-		}
+		xmax = max(x+boxWidth, x+count)
 	}
 	ymax := y + len(u.boxText)
 
@@ -930,23 +930,19 @@ func (u *UI) Run() error {
 		return fmt.Errorf("screen init: %w", err)
 	}
 
-	// Hijack fs.LogPrint so that it doesn't corrupt the screen.
-	if logPrint := fs.LogPrint; !log.Redirected() {
-		type log struct {
-			text  string
-			level fs.LogLevel
-		}
-		var logs []log
-		fs.LogPrint = func(level fs.LogLevel, text string) {
+	// Hijack log output so that it doesn't corrupt the screen.
+	if !log.Redirected() {
+		var logs []string
+		log.Handler.SetOutput(func(level slog.Level, text string) {
 			if len(logs) > 100 {
 				logs = logs[len(logs)-100:]
 			}
-			logs = append(logs, log{level: level, text: text})
-		}
+			logs = append(logs, text)
+		})
 		defer func() {
-			fs.LogPrint = logPrint
-			for i := range logs {
-				logPrint(logs[i].level, logs[i].text)
+			log.Handler.ResetOutput()
+			for _, text := range logs {
+				_, _ = os.Stderr.WriteString(text)
 			}
 		}()
 	}
@@ -990,7 +986,7 @@ outer:
 				}
 				switch c {
 				case key(tcell.KeyEsc), key(tcell.KeyCtrlC), 'q':
-					if u.showBox {
+					if u.showBox || c == key(tcell.KeyEsc) {
 						u.showBox = false
 					} else {
 						break outer

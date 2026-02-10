@@ -5,12 +5,17 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"os"
+	"path"
+	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/fs/sync"
 	"github.com/rclone/rclone/fstest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -119,6 +124,46 @@ func TestCopyFile(t *testing.T) {
 	require.NoError(t, err)
 	r.CheckLocalItems(t, file1)
 	r.CheckRemoteItems(t, file2)
+}
+
+// Find the longest file name for writing to local
+func maxLengthFileName(t *testing.T, r *fstest.Run) string {
+	require.NoError(t, r.Flocal.Mkdir(context.Background(), "")) // create the root
+	const maxLen = 16 * 1024
+	name := strings.Repeat("A", maxLen)
+	i := sort.Search(len(name), func(i int) (fail bool) {
+		filePath := path.Join(r.LocalName, name[:i])
+		err := os.WriteFile(filePath, []byte{0}, 0777)
+		if err != nil {
+			return true
+		}
+		err = os.Remove(filePath)
+		if err != nil {
+			t.Logf("Failed to remove test file: %v", err)
+		}
+		return false
+	})
+	return name[:i-1]
+}
+
+// Check we can copy a file of maximum name length
+func TestCopyLongFile(t *testing.T) {
+	ctx := context.Background()
+	r := fstest.NewRun(t)
+	if !r.Fremote.Features().IsLocal {
+		t.Skip("Test only runs on local")
+	}
+
+	// Find the maximum length of file we can write
+	name := maxLengthFileName(t, r)
+	t.Logf("Max length of file name is %d", len(name))
+	file1 := r.WriteFile(name, "file1 contents", t1)
+	r.CheckLocalItems(t, file1)
+
+	err := operations.CopyFile(ctx, r.Fremote, r.Flocal, file1.Path, file1.Path)
+	require.NoError(t, err)
+	r.CheckLocalItems(t, file1)
+	r.CheckRemoteItems(t, file1)
 }
 
 func TestCopyFileBackupDir(t *testing.T) {
@@ -383,6 +428,32 @@ func TestCopyLongFileName(t *testing.T) {
 	r.CheckRemoteItems(t, file2)
 }
 
+func TestCopyLongFileNameCollision(t *testing.T) {
+	ctx := context.Background()
+	ctx, ci := fs.AddConfig(ctx)
+	r := fstest.NewRun(t)
+
+	if !r.Fremote.Features().PartialUploads {
+		t.Skip("Partial uploads not supported")
+	}
+
+	ci.Inplace = false
+	ci.Transfers = 4
+
+	// Write a lot of identical files with long names
+	files := make([]fstest.Item, 10)
+	namePrefix := strings.Repeat("file1", 30)
+	for i := range files {
+		files[i] = r.WriteFile(fmt.Sprintf("%s%02d", namePrefix, i), "file1 contents", t1)
+	}
+	r.CheckLocalItems(t, files...)
+
+	err := sync.CopyDir(ctx, r.Fremote, r.Flocal, false)
+	require.NoError(t, err)
+	r.CheckLocalItems(t, files...)
+	r.CheckRemoteItems(t, files...)
+}
+
 func TestCopyFileMaxTransfer(t *testing.T) {
 	ctx := context.Background()
 	ctx, ci := fs.AddConfig(ctx)
@@ -405,6 +476,14 @@ func TestCopyFileMaxTransfer(t *testing.T) {
 	// Cutoff mode: Hard
 	ci.MaxTransfer = sizeCutoff
 	ci.CutoffMode = fs.CutoffModeHard
+
+	if runtime.GOOS == "darwin" {
+		// disable server-side copies as they don't count towards transfer size stats
+		r.Flocal.Features().Disable("Copy")
+		if r.Fremote.Features().IsLocal {
+			r.Fremote.Features().Disable("Copy")
+		}
+	}
 
 	// file1: Show a small file gets transferred OK
 	accounting.Stats(ctx).ResetCounters()

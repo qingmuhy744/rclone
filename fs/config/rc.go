@@ -3,10 +3,46 @@ package config
 import (
 	"context"
 	"errors"
+	"os"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/rc"
 )
+
+func init() {
+	rc.Add(rc.Call{
+		Path:         "config/unlock",
+		Fn:           rcConfigPassword,
+		Title:        "Unlock the config file.",
+		AuthRequired: true,
+		Help: `
+Unlocks the config file if it is locked.
+
+Parameters:
+
+- 'configPassword' - password to unlock the config file
+
+A good idea is to disable AskPassword before making this call
+`,
+	})
+}
+
+// Unlock the config file
+// A good idea is to disable AskPassword before making this call
+func rcConfigPassword(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	configPass, err := in.GetString("configPassword")
+	if err != nil {
+		var err2 error
+		configPass, err2 = in.GetString("config_password") // backwards compat
+		if err2 != nil {
+			return nil, err
+		}
+	}
+	if SetConfigPassword(configPass) != nil {
+		return nil, errors.New("failed to set config password")
+	}
+	return nil, nil
+}
 
 func init() {
 	rc.Add(rc.Call{
@@ -73,9 +109,12 @@ See the [listremotes](/commands/rclone_listremotes/) command for more informatio
 // Return the a list of remotes in the config file
 // including any defined by environment variables.
 func rcListRemotes(ctx context.Context, in rc.Params) (out rc.Params, err error) {
-	remotes := FileSections()
+	remoteNames := GetRemoteNames()
+	if remoteNames == nil {
+		remoteNames = []string{}
+	}
 	out = rc.Params{
-		"remotes": remotes,
+		"remotes": remoteNames,
 	}
 	return out, nil
 }
@@ -90,7 +129,12 @@ func init() {
 Returns a JSON object:
 - providers - array of objects
 
-See the [config providers](/commands/rclone_config_providers/) command for more information on the above.
+See the [config providers](/commands/rclone_config_providers/) command
+for more information on the above.
+
+Note that the Options blocks are in the same format as returned by
+"options/info". They are described in the
+[option blocks](#option-blocks) section.
 `,
 	})
 }
@@ -105,7 +149,6 @@ func rcProviders(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 
 func init() {
 	for _, name := range []string{"create", "update", "password"} {
-		name := name
 		extraHelp := ""
 		if name == "create" {
 			extraHelp = "- type - type of the new remote\n"
@@ -114,6 +157,7 @@ func init() {
 			extraHelp += `- opt - a dictionary of options to control the configuration
     - obscure - declare passwords are plain and need obscuring
     - noObscure - declare passwords are already obscured and don't need obscuring
+    - noOutput - don't print anything to stdout
     - nonInteractive - don't interact with a user, return questions
     - continue - continue the config process with an answer
     - all - ask all the config questions not just the post config ones
@@ -241,4 +285,39 @@ func rcSetPath(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	}
 	err = SetConfigPath(path)
 	return nil, err
+}
+
+func init() {
+	rc.Add(rc.Call{
+		Path:         "config/paths",
+		Fn:           rcPaths,
+		Title:        "Reads the config file path and other important paths.",
+		AuthRequired: true,
+		Help: `
+Returns a JSON object with the following keys:
+
+- config: path to config file
+- cache: path to root of cache directory
+- temp: path to root of temporary directory
+
+Eg
+
+    {
+        "cache": "/home/USER/.cache/rclone",
+        "config": "/home/USER/.rclone.conf",
+        "temp": "/tmp"
+    }
+
+See the [config paths](/commands/rclone_config_paths/) command for more information on the above.
+`,
+	})
+}
+
+// Set the config file path
+func rcPaths(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	return rc.Params{
+		"config": GetConfigPath(),
+		"cache":  GetCacheDir(),
+		"temp":   os.TempDir(),
+	}, nil
 }

@@ -28,6 +28,38 @@ func TestNewFilterDefault(t *testing.T) {
 	assert.True(t, f.InActive())
 }
 
+func TestParseHashFilter(t *testing.T) {
+	for _, test := range []struct {
+		hashFilter string
+		n          uint64
+		k          uint64
+		err        string
+	}{
+		{hashFilter: "", err: "no / found"},
+		{hashFilter: "17", err: "no / found"},
+		{hashFilter: "-1/2", err: "can't parse K="},
+		{hashFilter: "1/-2", err: "can't parse N="},
+		{hashFilter: "0/0", err: "N must be greater than 0"},
+		{hashFilter: "0/18446744073709551615", k: 0, n: 18446744073709551615},
+		{hashFilter: "0/18446744073709551616", err: "can't parse N="},
+		{hashFilter: "18446744073709551615/1", k: 0, n: 1},
+		{hashFilter: "18446744073709551616/1", err: "can't parse K="},
+		{hashFilter: "1/2", k: 1, n: 2},
+		{hashFilter: "17/3", k: 2, n: 3},
+		{hashFilter: "@/1", k: 0, n: 1},
+	} {
+		gotK, gotN, gotErr := parseHashFilter(test.hashFilter)
+		if test.err != "" {
+			assert.Error(t, gotErr)
+			assert.ErrorContains(t, gotErr, test.err, test.hashFilter)
+		} else {
+			assert.Equal(t, test.k, gotK, test.hashFilter)
+			assert.Equal(t, test.n, gotN, test.hashFilter)
+			assert.NoError(t, gotErr, test.hashFilter)
+		}
+	}
+}
+
 // testFile creates a temp file with the contents
 func testFile(t *testing.T, contents string) string {
 	out, err := os.CreateTemp("", "filter_test")
@@ -43,7 +75,7 @@ func testFile(t *testing.T, contents string) string {
 }
 
 func TestNewFilterForbiddenMixOfFilesFromAndFilterRule(t *testing.T) {
-	Opt := DefaultOpt
+	Opt := Opt
 
 	// Set up the input
 	Opt.FilterRule = []string{"- filter1", "- filter1b"}
@@ -66,7 +98,7 @@ func TestNewFilterForbiddenMixOfFilesFromAndFilterRule(t *testing.T) {
 }
 
 func TestNewFilterForbiddenMixOfFilesFromRawAndFilterRule(t *testing.T) {
-	Opt := DefaultOpt
+	Opt := Opt
 
 	// Set up the input
 	Opt.FilterRule = []string{"- filter1", "- filter1b"}
@@ -89,7 +121,7 @@ func TestNewFilterForbiddenMixOfFilesFromRawAndFilterRule(t *testing.T) {
 }
 
 func TestNewFilterWithFilesFromAlone(t *testing.T) {
-	Opt := DefaultOpt
+	Opt := Opt
 
 	// Set up the input
 	Opt.FilesFrom = []string{testFile(t, "#comment\nfiles1\nfiles2\n")}
@@ -117,7 +149,7 @@ func TestNewFilterWithFilesFromAlone(t *testing.T) {
 }
 
 func TestNewFilterWithFilesFromRaw(t *testing.T) {
-	Opt := DefaultOpt
+	Opt := Opt
 
 	// Set up the input
 	Opt.FilesFromRaw = []string{testFile(t, "#comment\nfiles1\nfiles2\n")}
@@ -145,7 +177,7 @@ func TestNewFilterWithFilesFromRaw(t *testing.T) {
 }
 
 func TestNewFilterFullExceptFilesFromOpt(t *testing.T) {
-	Opt := DefaultOpt
+	Opt := Opt
 
 	mins := fs.SizeSuffix(100 * 1024)
 	maxs := fs.SizeSuffix(1000 * 1024)
@@ -180,7 +212,9 @@ func TestNewFilterFullExceptFilesFromOpt(t *testing.T) {
 	assert.Equal(t, f.Opt.MinSize, mins)
 	assert.Equal(t, f.Opt.MaxSize, maxs)
 	got := f.DumpFilters()
-	want := `--- File filter rules ---
+	want := `Minimum size is: 100 KiB
+Maximum size is: 1000 KiB
+--- File filter rules ---
 + (^|/)include1$
 + (^|/)include2$
 + (^|/)include3$
@@ -207,6 +241,7 @@ type includeTest struct {
 }
 
 func testInclude(t *testing.T, f *Filter, tests []includeTest) {
+	t.Helper()
 	for _, test := range tests {
 		got := f.Include(test.in, test.size, time.Unix(test.modTime, 0), nil)
 		assert.Equal(t, test.want, got, fmt.Sprintf("in=%q, size=%v, modTime=%v", test.in, test.size, time.Unix(test.modTime, 0)))
@@ -535,6 +570,42 @@ func TestNewFilterMatchesRegexp(t *testing.T) {
 		{"anything at all", true},
 	})
 	assert.False(t, f.InActive())
+}
+
+func TestNewFilterHashFilter(t *testing.T) {
+	const e1 = "filé1.jpg" // one of the unicode E characters
+	const e2 = "filé1.jpg"  // a different unicode E character
+	assert.NotEqual(t, e1, e2)
+	for i := 0; i <= 4; i++ {
+		opt := Opt
+		opt.HashFilter = fmt.Sprintf("%d/4", i)
+		opt.ExcludeRule = []string{"*.bin"}
+		f, err := NewFilter(&opt)
+		require.NoError(t, err)
+		t.Run(opt.HashFilter, func(t *testing.T) {
+			testInclude(t, f, []includeTest{
+				{"file1.jpg", 0, 0, i == 0 || i == 4},
+				{"FILE1.jpg", 0, 0, i == 0 || i == 4},
+				{"file2.jpg", 1, 0, i == 2},
+				{"File2.jpg", 1, 0, i == 2},
+				{"file3.jpg", 2, 0, i == 1},
+				{"file4.jpg", 3, 0, i == 2},
+				{"file5.jpg", 4, 0, i == 0 || i == 4},
+				{"file6.jpg", 5, 0, i == 1},
+				{"file7.jpg", 6, 0, i == 3},
+				{"file8.jpg", 7, 0, i == 3},
+				{"file9.jpg", 7, 0, i == 1},
+				{e1, 0, 0, i == 3},
+				{e2, 0, 0, i == 3},
+				{"hello" + e1, 0, 0, i == 2},
+				{"HELLO" + e2, 0, 0, i == 2},
+				{"hello1" + e1, 0, 0, i == 1},
+				{"Hello1" + e2, 0, 0, i == 1},
+				{"exclude.bin", 8, 0, false},
+			})
+		})
+		assert.False(t, f.InActive())
+	}
 }
 
 type includeTestMetadata struct {

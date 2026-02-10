@@ -67,13 +67,13 @@ func init() {
 			Sensitive: true,
 		}, {
 			Name:       "password",
-			Help:       "Your password for rclone (generate one at https://app.koofr.net/app/admin/preferences/password).",
+			Help:       "Your password for rclone generate one at https://app.koofr.net/app/admin/preferences/password.",
 			Provider:   "koofr",
 			IsPassword: true,
 			Required:   true,
 		}, {
 			Name:       "password",
-			Help:       "Your password for rclone (generate one at https://storage.rcs-rds.ro/app/admin/preferences/password).",
+			Help:       "Your password for rclone generate one at https://storage.rcs-rds.ro/app/admin/preferences/password.",
 			Provider:   "digistorage",
 			IsPassword: true,
 			Required:   true,
@@ -461,7 +461,7 @@ func translateErrorsDir(err error) error {
 	return err
 }
 
-// translatesErrorsObject translates Koofr errors to rclone errors (for an object operation)
+// translateErrorsObject translates Koofr errors to rclone errors (for an object operation)
 func translateErrorsObject(err error) error {
 	switch err := err.(type) {
 	case httpclient.InvalidStatusError:

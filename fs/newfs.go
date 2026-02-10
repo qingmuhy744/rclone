@@ -6,12 +6,16 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/base64"
+	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fspath"
 )
 
@@ -64,11 +68,63 @@ func NewFs(ctx context.Context, path string) (Fs, error) {
 		overriddenConfig[suffix] = extraConfig
 		overriddenConfigMu.Unlock()
 	}
+	ctx, err = addConfigToContext(ctx, configName, config)
+	if err != nil {
+		return nil, err
+	}
 	f, err := fsInfo.NewFs(ctx, configName, fsPath, config)
 	if f != nil && (err == nil || err == ErrorIsFile) {
 		addReverse(f, fsInfo)
 	}
 	return f, err
+}
+
+// Add "global" config or "override" to ctx and the global config if required.
+//
+// This looks through keys prefixed with "global." or "override." in
+// config and sets ctx and optionally the global context if "global.".
+func addConfigToContext(ctx context.Context, configName string, config configmap.Getter) (newCtx context.Context, err error) {
+	overrideConfig := make(configmap.Simple)
+	globalConfig := make(configmap.Simple)
+	for i := range ConfigOptionsInfo {
+		opt := &ConfigOptionsInfo[i]
+		globalName := "global." + opt.Name
+		value, isSet := config.Get(globalName)
+		if isSet {
+			// Set both override and global if global
+			overrideConfig[opt.Name] = value
+			globalConfig[opt.Name] = value
+		}
+		overrideName := "override." + opt.Name
+		value, isSet = config.Get(overrideName)
+		if isSet {
+			overrideConfig[opt.Name] = value
+		}
+	}
+	if len(overrideConfig) == 0 && len(globalConfig) == 0 {
+		return ctx, nil
+	}
+	newCtx, ci := AddConfig(ctx)
+	overrideKeys := slices.Collect(maps.Keys(overrideConfig))
+	slices.Sort(overrideKeys)
+	globalKeys := slices.Collect(maps.Keys(globalConfig))
+	slices.Sort(globalKeys)
+	// Set the config in the newCtx
+	err = configstruct.Set(overrideConfig, ci)
+	if err != nil {
+		return ctx, fmt.Errorf("failed to set override config variables %q: %w", overrideKeys, err)
+	}
+	Debugf(configName, "Set overridden config %q for backend startup", overrideKeys)
+	// Set the global context only
+	if len(globalConfig) != 0 {
+		globalCI := GetConfig(context.Background())
+		err = configstruct.Set(globalConfig, globalCI)
+		if err != nil {
+			return ctx, fmt.Errorf("failed to set global config variables %q: %w", globalKeys, err)
+		}
+		Debugf(configName, "Set global config %q at backend startup", overrideKeys)
+	}
+	return newCtx, nil
 }
 
 // ConfigFs makes the config for calling NewFs with.
@@ -83,7 +139,7 @@ func ConfigFs(path string) (fsInfo *RegInfo, configName, fsPath string, config *
 	if err != nil {
 		return
 	}
-	config = ConfigMap(fsInfo, configName, connectionStringConfig)
+	config = ConfigMap(fsInfo.Prefix, fsInfo.Options, configName, connectionStringConfig)
 	return
 }
 
@@ -101,10 +157,10 @@ func ParseRemote(path string) (fsInfo *RegInfo, configName, fsPath string, conne
 		if strings.HasPrefix(configName, ":") {
 			fsName = configName[1:]
 		} else {
-			m := ConfigMap(nil, configName, parsed.Config)
+			m := ConfigMap("", nil, configName, parsed.Config)
 			fsName, ok = m.Get("type")
 			if !ok {
-				return nil, "", "", nil, ErrorNotFoundInConfigFile
+				return nil, "", "", nil, fmt.Errorf("%w (%q)", ErrorNotFoundInConfigFile, configName)
 			}
 		}
 	} else {
@@ -117,7 +173,7 @@ func ParseRemote(path string) (fsInfo *RegInfo, configName, fsPath string, conne
 
 // configString returns a canonical version of the config string used
 // to configure the Fs as passed to fs.NewFs
-func configString(f Fs, full bool) string {
+func configString(f Info, full bool) string {
 	name := f.Name()
 	if open := strings.IndexRune(name, '{'); full && open >= 0 && strings.HasSuffix(name, "}") {
 		suffix := name[open:]
@@ -140,8 +196,14 @@ func configString(f Fs, full bool) string {
 // ConfigString returns a canonical version of the config string used
 // to configure the Fs as passed to fs.NewFs. For Fs with extra
 // parameters this will include a canonical {hexstring} suffix.
-func ConfigString(f Fs) string {
+func ConfigString(f Info) string {
 	return configString(f, false)
+}
+
+// FullPath returns the full path with remote:path/to/object
+// for an object.
+func FullPath(o Object) string {
+	return fspath.JoinRootPath(ConfigString(o.Fs()), o.Remote())
 }
 
 // ConfigStringFull returns a canonical version of the config string

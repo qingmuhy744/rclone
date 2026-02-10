@@ -192,7 +192,7 @@ func newCipher(mode NameEncryptionMode, password, salt string, dirNameEncrypt bo
 		dirNameEncrypt:  dirNameEncrypt,
 		encryptedSuffix: ".bin",
 	}
-	c.buffers.New = func() interface{} {
+	c.buffers.New = func() any {
 		return new([blockSize]byte)
 	}
 	err := c.Key(password, salt)
@@ -329,14 +329,14 @@ func (c *Cipher) obfuscateSegment(plaintext string) string {
 	for _, runeValue := range plaintext {
 		dir += int(runeValue)
 	}
-	dir = dir % 256
+	dir %= 256
 
 	// We'll use this number to store in the result filename...
 	var result bytes.Buffer
 	_, _ = result.WriteString(strconv.Itoa(dir) + ".")
 
 	// but we'll augment it with the nameKey for real calculation
-	for i := 0; i < len(c.nameKey); i++ {
+	for i := range len(c.nameKey) {
 		dir += int(c.nameKey[i])
 	}
 
@@ -403,14 +403,14 @@ func (c *Cipher) deobfuscateSegment(ciphertext string) (string, error) {
 	if ciphertext == "" {
 		return "", nil
 	}
-	pos := strings.Index(ciphertext, ".")
-	if pos == -1 {
+	before, after, ok := strings.Cut(ciphertext, ".")
+	if !ok {
 		return "", ErrorNotAnEncryptedFile
 	} // No .
-	num := ciphertext[:pos]
+	num := before
 	if num == "!" {
 		// No rotation; probably original was not valid unicode
-		return ciphertext[pos+1:], nil
+		return after, nil
 	}
 	dir, err := strconv.Atoi(num)
 	if err != nil {
@@ -418,14 +418,14 @@ func (c *Cipher) deobfuscateSegment(ciphertext string) (string, error) {
 	}
 
 	// add the nameKey to get the real rotate distance
-	for i := 0; i < len(c.nameKey); i++ {
+	for i := range len(c.nameKey) {
 		dir += int(c.nameKey[i])
 	}
 
 	var result bytes.Buffer
 
 	inQuote := false
-	for _, runeValue := range ciphertext[pos+1:] {
+	for _, runeValue := range after {
 		switch {
 		case inQuote:
 			_, _ = result.WriteRune(runeValue)
@@ -450,7 +450,7 @@ func (c *Cipher) deobfuscateSegment(ciphertext string) (string, error) {
 			if pos >= 26 {
 				pos -= 6
 			}
-			pos = pos - thisdir
+			pos -= thisdir
 			if pos < 0 {
 				pos += 52
 			}
@@ -664,7 +664,7 @@ func (n *nonce) increment() {
 // add a uint64 to the nonce
 func (n *nonce) add(x uint64) {
 	carry := uint16(0)
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		digit := (*n)[i]
 		xDigit := byte(x)
 		x >>= 8
@@ -888,7 +888,7 @@ func (fh *decrypter) fillBuffer() (err error) {
 		fs.Errorf(nil, "crypt: ignoring: %v", ErrorEncryptedBadBlock)
 		// Zero out the bad block and continue
 		for i := range (*fh.buf)[:n] {
-			(*fh.buf)[i] = 0
+			fh.buf[i] = 0
 		}
 	}
 	fh.bufIndex = 0

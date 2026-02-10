@@ -1,5 +1,4 @@
 //go:build !plan9 && !js
-// +build !plan9,!js
 
 // Package cache implements a virtual provider to cache existing remotes.
 package cache
@@ -30,6 +29,7 @@ import (
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/atexit"
@@ -410,18 +410,16 @@ func NewFs(ctx context.Context, name, rootPath string, m configmap.Mapper) (fs.F
 			if err != nil {
 				return nil, fmt.Errorf("failed to connect to the Plex API %v: %w", opt.PlexURL, err)
 			}
-		} else {
-			if opt.PlexPassword != "" && opt.PlexUsername != "" {
-				decPass, err := obscure.Reveal(opt.PlexPassword)
-				if err != nil {
-					decPass = opt.PlexPassword
-				}
-				f.plexConnector, err = newPlexConnector(f, opt.PlexURL, opt.PlexUsername, decPass, opt.PlexInsecure, func(token string) {
-					m.Set("plex_token", token)
-				})
-				if err != nil {
-					return nil, fmt.Errorf("failed to connect to the Plex API %v: %w", opt.PlexURL, err)
-				}
+		} else if opt.PlexPassword != "" && opt.PlexUsername != "" {
+			decPass, err := obscure.Reveal(opt.PlexPassword)
+			if err != nil {
+				decPass = opt.PlexPassword
+			}
+			f.plexConnector, err = newPlexConnector(f, opt.PlexURL, opt.PlexUsername, decPass, opt.PlexInsecure, func(token string) {
+				m.Set("plex_token", token)
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to connect to the Plex API %v: %w", opt.PlexURL, err)
 			}
 		}
 	}
@@ -686,7 +684,7 @@ func (f *Fs) rcFetch(ctx context.Context, in rc.Params) (rc.Params, error) {
 		start, end int64
 	}
 	parseChunks := func(ranges string) (crs []chunkRange, err error) {
-		for _, part := range strings.Split(ranges, ",") {
+		for part := range strings.SplitSeq(ranges, ",") {
 			var start, end int64 = 0, math.MaxInt64
 			switch ints := strings.Split(part, ":"); len(ints) {
 			case 1:
@@ -1089,13 +1087,13 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	return cachedEntries, nil
 }
 
-func (f *Fs) recurse(ctx context.Context, dir string, list *walk.ListRHelper) error {
+func (f *Fs) recurse(ctx context.Context, dir string, list *list.Helper) error {
 	entries, err := f.List(ctx, dir)
 	if err != nil {
 		return err
 	}
 
-	for i := 0; i < len(entries); i++ {
+	for i := range entries {
 		innerDir, ok := entries[i].(fs.Directory)
 		if ok {
 			err := f.recurse(ctx, innerDir.Remote(), list)
@@ -1141,7 +1139,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 	}
 
 	// if we're here, we're gonna do a standard recursive traversal and cache everything
-	list := walk.NewListRHelper(callback)
+	list := list.NewHelper(callback)
 	err = f.recurse(ctx, dir, list)
 	if err != nil {
 		return err
@@ -1431,7 +1429,7 @@ func (f *Fs) cacheReader(u io.Reader, src fs.ObjectInfo, originalRead func(inn i
 	}()
 
 	// wait until both are done
-	for c := 0; c < 2; c++ {
+	for range 2 {
 		<-done
 	}
 }
@@ -1756,7 +1754,7 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 }
 
 // Stats returns stats about the cache storage
-func (f *Fs) Stats() (map[string]map[string]interface{}, error) {
+func (f *Fs) Stats() (map[string]map[string]any, error) {
 	return f.cache.Stats()
 }
 
@@ -1936,7 +1934,7 @@ var commandHelp = []fs.CommandHelp{
 // The result should be capable of being JSON encoded
 // If it is a string or a []string it will be shown to the user
 // otherwise it will be JSON encoded and shown to the user like that
-func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (interface{}, error) {
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (any, error) {
 	switch name {
 	case "stats":
 		return f.Stats()

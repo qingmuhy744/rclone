@@ -37,15 +37,16 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/env"
 	"github.com/rclone/rclone/lib/jwtutil"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/rest"
 	"github.com/youmark/pkcs8"
-	"golang.org/x/oauth2"
 )
 
 const (
@@ -64,12 +65,10 @@ const (
 // Globals
 var (
 	// Description of how to auth for this app
-	oauthConfig = &oauth2.Config{
-		Scopes: nil,
-		Endpoint: oauth2.Endpoint{
-			AuthURL:  "https://app.box.com/api/oauth2/authorize",
-			TokenURL: "https://app.box.com/api/oauth2/token",
-		},
+	oauthConfig = &oauthutil.Config{
+		Scopes:       nil,
+		AuthURL:      "https://app.box.com/api/oauth2/authorize",
+		TokenURL:     "https://app.box.com/api/oauth2/token",
 		ClientID:     rcloneClientID,
 		ClientSecret: obscure.MustReveal(rcloneEncryptedClientSecret),
 		RedirectURL:  oauthutil.RedirectURL,
@@ -88,13 +87,11 @@ func init() {
 		Description: "Box",
 		NewFs:       NewFs,
 		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
-			jsonFile, ok := m.Get("box_config_file")
-			boxSubType, boxSubTypeOk := m.Get("box_sub_type")
 			boxAccessToken, boxAccessTokenOk := m.Get("access_token")
 			var err error
 			// If using box config.json, use JWT auth
-			if ok && boxSubTypeOk && jsonFile != "" && boxSubType != "" {
-				err = refreshJWTToken(ctx, jsonFile, boxSubType, name, m)
+			if usesJWTAuth(m) {
+				err = refreshJWTToken(ctx, name, m)
 				if err != nil {
 					return nil, fmt.Errorf("failed to configure token with jwt authentication: %w", err)
 				}
@@ -115,6 +112,11 @@ func init() {
 		}, {
 			Name: "box_config_file",
 			Help: "Box App config.json location\n\nLeave blank normally." + env.ShellExpandHelp,
+		}, {
+			Name:      "config_credentials",
+			Help:      "Box App config.json contents.\n\nLeave blank normally.",
+			Hide:      fs.OptionHideBoth,
+			Sensitive: true,
 		}, {
 			Name:      "access_token",
 			Help:      "Box App Primary Access Token\n\nLeave blank normally.",
@@ -185,9 +187,17 @@ See: https://developer.box.com/guides/authentication/jwt/as-user/
 	})
 }
 
-func refreshJWTToken(ctx context.Context, jsonFile string, boxSubType string, name string, m configmap.Mapper) error {
-	jsonFile = env.ShellExpand(jsonFile)
-	boxConfig, err := getBoxConfig(jsonFile)
+func usesJWTAuth(m configmap.Mapper) bool {
+	jsonFile, okFile := m.Get("box_config_file")
+	jsonFileCredentials, okCredentials := m.Get("config_credentials")
+	boxSubType, boxSubTypeOk := m.Get("box_sub_type")
+	return (okFile || okCredentials) && boxSubTypeOk && (jsonFile != "" || jsonFileCredentials != "") && boxSubType != ""
+}
+
+func refreshJWTToken(ctx context.Context, name string, m configmap.Mapper) error {
+	boxSubType, _ := m.Get("box_sub_type")
+
+	boxConfig, err := getBoxConfig(m)
 	if err != nil {
 		return fmt.Errorf("get box config: %w", err)
 	}
@@ -206,12 +216,19 @@ func refreshJWTToken(ctx context.Context, jsonFile string, boxSubType string, na
 	return err
 }
 
-func getBoxConfig(configFile string) (boxConfig *api.ConfigJSON, err error) {
-	file, err := os.ReadFile(configFile)
-	if err != nil {
-		return nil, fmt.Errorf("box: failed to read Box config: %w", err)
+func getBoxConfig(m configmap.Mapper) (boxConfig *api.ConfigJSON, err error) {
+	configFileCredentials, _ := m.Get("config_credentials")
+	configFileBytes := []byte(configFileCredentials)
+
+	if configFileCredentials == "" {
+		configFile, _ := m.Get("box_config_file")
+		configFileBytes, err = os.ReadFile(configFile)
+		if err != nil {
+			return nil, fmt.Errorf("box: failed to read Box config: %w", err)
+		}
 	}
-	err = json.Unmarshal(file, &boxConfig)
+
+	err = json.Unmarshal(configFileBytes, &boxConfig)
 	if err != nil {
 		return nil, fmt.Errorf("box: failed to parse Box config: %w", err)
 	}
@@ -239,8 +256,8 @@ func getClaims(boxConfig *api.ConfigJSON, boxSubType string) (claims *boxCustomC
 	return claims, nil
 }
 
-func getSigningHeaders(boxConfig *api.ConfigJSON) map[string]interface{} {
-	signingHeaders := map[string]interface{}{
+func getSigningHeaders(boxConfig *api.ConfigJSON) map[string]any {
+	signingHeaders := map[string]any{
 		"kid": boxConfig.BoxAppSettings.AppAuth.PublicKeyID,
 	}
 	return signingHeaders
@@ -256,8 +273,10 @@ func getQueryParams(boxConfig *api.ConfigJSON) map[string]string {
 }
 
 func getDecryptedPrivateKey(boxConfig *api.ConfigJSON) (key *rsa.PrivateKey, err error) {
-
 	block, rest := pem.Decode([]byte(boxConfig.BoxAppSettings.AppAuth.PrivateKey))
+	if block == nil {
+		return nil, errors.New("box: failed to PEM decode private key")
+	}
 	if len(rest) > 0 {
 		return nil, fmt.Errorf("box: extra data included in private key: %w", err)
 	}
@@ -484,15 +503,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		f.srv.SetHeader("as-user", f.opt.Impersonate)
 	}
 
-	jsonFile, ok := m.Get("box_config_file")
-	boxSubType, boxSubTypeOk := m.Get("box_sub_type")
-
 	if ts != nil {
 		// If using box config.json and JWT, renewing should just refresh the token and
 		// should do so whether there are uploads pending or not.
-		if ok && boxSubTypeOk && jsonFile != "" && boxSubType != "" {
+		if usesJWTAuth(m) {
 			f.tokenRenewer = oauthutil.NewRenew(f.String(), ts, func() error {
-				err := refreshJWTToken(ctx, jsonFile, boxSubType, name, m)
+				err := refreshJWTToken(ctx, name, m)
 				return err
 			})
 			f.tokenRenewer.Start()
@@ -619,7 +635,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
-		//fmt.Printf("...Error %v\n", err)
+		// fmt.Printf("...Error %v\n", err)
 		return "", err
 	}
 	// fmt.Printf("...Id %q\n", *info.Id)
@@ -705,9 +721,27 @@ OUTER:
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	return list.WithListP(ctx, dir, f)
+}
+
+// ListP lists the objects and directories of the Fs starting
+// from dir non recursively into out.
+//
+// dir should be "" to start from the root, and should not
+// have trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+//
+// It should call callback for each tranche of entries read.
+// These need not be returned in any particular order.  If
+// callback returns an error then the listing will stop
+// immediately.
+func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) error {
+	list := list.NewHelper(callback)
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	var iErr error
 	_, err = f.listAll(ctx, directoryID, false, false, true, func(info *api.Item) bool {
@@ -717,14 +751,22 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			f.dirCache.Put(remote, info.ID)
 			d := fs.NewDir(remote, info.ModTime()).SetID(info.ID)
 			// FIXME more info from dir?
-			entries = append(entries, d)
+			err = list.Add(d)
+			if err != nil {
+				iErr = err
+				return true
+			}
 		} else if info.Type == api.ItemTypeFile {
 			o, err := f.newObjectWithInfo(ctx, remote, info)
 			if err != nil {
 				iErr = err
 				return true
 			}
-			entries = append(entries, o)
+			err = list.Add(o)
+			if err != nil {
+				iErr = err
+				return true
+			}
 		}
 
 		// Cache some metadata for this Item to help us process events later
@@ -740,12 +782,12 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		return false
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if iErr != nil {
-		return nil, iErr
+		return iErr
 	}
-	return entries, nil
+	return list.Flush()
 }
 
 // Creates from the parameters passed in a half finished Object which
@@ -964,6 +1006,26 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	dstObj, leaf, directoryID, err := f.createObject(ctx, remote, srcObj.modTime, srcObj.size)
 	if err != nil {
 		return nil, err
+	}
+
+	// check if dest already exists
+	item, err := f.preUploadCheck(ctx, leaf, directoryID, src.Size())
+	if err != nil {
+		return nil, err
+	}
+	if item != nil { // dest already exists, need to copy to temp name and then move
+		tempSuffix := "-rclone-copy-" + random.String(8)
+		fs.Debugf(remote, "dst already exists, copying to temp name %v", remote+tempSuffix)
+		tempObj, err := f.Copy(ctx, src, remote+tempSuffix)
+		if err != nil {
+			return nil, err
+		}
+		fs.Debugf(remote+tempSuffix, "moving to real name %v", remote)
+		err = f.deleteObject(ctx, item.ID)
+		if err != nil {
+			return nil, err
+		}
+		return f.Move(ctx, tempObj, remote)
 	}
 
 	// Copy the object
@@ -1207,6 +1269,12 @@ func (f *Fs) CleanUp(ctx context.Context) (err error) {
 	return err
 }
 
+// Shutdown shutdown the fs
+func (f *Fs) Shutdown(ctx context.Context) error {
+	f.tokenRenewer.Shutdown()
+	return nil
+}
+
 // ChangeNotify calls the passed function with a path that has had changes.
 // If the implementation uses polling, it should adhere to the given interval.
 //
@@ -1317,12 +1385,8 @@ func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.
 	nextStreamPosition = streamPosition
 
 	for {
-		limit := f.opt.ListChunk
-
 		// box only allows a max of 500 events
-		if limit > 500 {
-			limit = 500
-		}
+		limit := min(f.opt.ListChunk, 500)
 
 		opts := rest.Opts{
 			Method:     "GET",
@@ -1719,6 +1783,8 @@ var (
 	_ fs.DirCacheFlusher = (*Fs)(nil)
 	_ fs.PublicLinker    = (*Fs)(nil)
 	_ fs.CleanUpper      = (*Fs)(nil)
+	_ fs.ListPer         = (*Fs)(nil)
+	_ fs.Shutdowner      = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
 	_ fs.IDer            = (*Object)(nil)
 )

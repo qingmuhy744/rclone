@@ -1,6 +1,6 @@
 // Upload large files for b2
 //
-// Docs - https://www.backblaze.com/b2/docs/large_files.html
+// Docs - https://www.backblaze.com/docs/cloud-storage-large-files
 
 package b2
 
@@ -91,7 +91,7 @@ type largeUpload struct {
 // newLargeUpload starts an upload of object o from in with metadata in src
 //
 // If newInfo is set then metadata from that will be used instead of reading it from src
-func (f *Fs) newLargeUpload(ctx context.Context, o *Object, in io.Reader, src fs.ObjectInfo, defaultChunkSize fs.SizeSuffix, doCopy bool, newInfo *api.File) (up *largeUpload, err error) {
+func (f *Fs) newLargeUpload(ctx context.Context, o *Object, in io.Reader, src fs.ObjectInfo, defaultChunkSize fs.SizeSuffix, doCopy bool, newInfo *api.File, options ...fs.OpenOption) (up *largeUpload, err error) {
 	size := src.Size()
 	parts := 0
 	chunkSize := defaultChunkSize
@@ -104,11 +104,6 @@ func (f *Fs) newLargeUpload(ctx context.Context, o *Object, in io.Reader, src fs
 			parts++
 		}
 	}
-
-	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/b2_start_large_file",
-	}
 	bucket, bucketPath := o.split()
 	bucketID, err := f.getBucketID(ctx, bucket)
 	if err != nil {
@@ -118,11 +113,26 @@ func (f *Fs) newLargeUpload(ctx context.Context, o *Object, in io.Reader, src fs
 		BucketID: bucketID,
 		Name:     f.opt.Enc.FromStandardPath(bucketPath),
 	}
+	optionsToSend := make([]fs.OpenOption, 0, len(options))
 	if newInfo == nil {
-		modTime := src.ModTime(ctx)
+		modTime, err := o.getModTime(ctx, src, options)
+		if err != nil {
+			return nil, err
+		}
+
 		request.ContentType = fs.MimeType(ctx, src)
 		request.Info = map[string]string{
 			timeKey: timeString(modTime),
+		}
+		// Custom upload headers - remove header prefix since they are sent in the body
+		for _, option := range options {
+			k, v := option.Header()
+			k = strings.ToLower(k)
+			if strings.HasPrefix(k, headerPrefix) {
+				request.Info[k[len(headerPrefix):]] = v
+			} else {
+				optionsToSend = append(optionsToSend, option)
+			}
 		}
 		// Set the SHA1 if known
 		if !o.fs.opt.DisableCheckSum || doCopy {
@@ -133,6 +143,19 @@ func (f *Fs) newLargeUpload(ctx context.Context, o *Object, in io.Reader, src fs
 	} else {
 		request.ContentType = newInfo.ContentType
 		request.Info = newInfo.Info
+	}
+	if o.fs.opt.SSECustomerKey != "" && o.fs.opt.SSECustomerKeyMD5 != "" {
+		request.ServerSideEncryption = &api.ServerSideEncryption{
+			Mode:           "SSE-C",
+			Algorithm:      o.fs.opt.SSECustomerAlgorithm,
+			CustomerKey:    o.fs.opt.SSECustomerKeyBase64,
+			CustomerKeyMd5: o.fs.opt.SSECustomerKeyMD5,
+		}
+	}
+	opts := rest.Opts{
+		Method:  "POST",
+		Path:    "/b2_start_large_file",
+		Options: optionsToSend,
 	}
 	var response api.StartLargeFileResponse
 	err = f.pacer.Call(func() (bool, error) {
@@ -280,6 +303,12 @@ func (up *largeUpload) WriteChunk(ctx context.Context, chunkNumber int, reader i
 			ContentLength: &sizeWithHash,
 		}
 
+		if up.o.fs.opt.SSECustomerKey != "" && up.o.fs.opt.SSECustomerKeyMD5 != "" {
+			opts.ExtraHeaders[sseAlgorithmHeader] = up.o.fs.opt.SSECustomerAlgorithm
+			opts.ExtraHeaders[sseKeyHeader] = up.o.fs.opt.SSECustomerKeyBase64
+			opts.ExtraHeaders[sseMd5Header] = up.o.fs.opt.SSECustomerKeyMD5
+		}
+
 		var response api.UploadPartResponse
 
 		resp, err := up.f.srv.CallJSON(ctx, &opts, nil, &response)
@@ -318,6 +347,17 @@ func (up *largeUpload) copyChunk(ctx context.Context, part int, partSize int64) 
 			LargeFileID: up.id,
 			PartNumber:  int64(part + 1),
 			Range:       fmt.Sprintf("bytes=%d-%d", offset, offset+partSize-1),
+		}
+
+		if up.o.fs.opt.SSECustomerKey != "" && up.o.fs.opt.SSECustomerKeyMD5 != "" {
+			serverSideEncryptionConfig := api.ServerSideEncryption{
+				Mode:           "SSE-C",
+				Algorithm:      up.o.fs.opt.SSECustomerAlgorithm,
+				CustomerKey:    up.o.fs.opt.SSECustomerKeyBase64,
+				CustomerKeyMd5: up.o.fs.opt.SSECustomerKeyMD5,
+			}
+			request.SourceServerSideEncryption = &serverSideEncryptionConfig
+			request.DestinationServerSideEncryption = &serverSideEncryptionConfig
 		}
 		var response api.UploadPartResponse
 		resp, err := up.f.srv.CallJSON(ctx, &opts, &request, &response)
@@ -463,17 +503,14 @@ func (up *largeUpload) Copy(ctx context.Context) (err error) {
 		remaining = up.size
 	)
 	g.SetLimit(up.f.opt.UploadConcurrency)
-	for part := 0; part < up.parts; part++ {
+	for part := range up.parts {
 		// Fail fast, in case an errgroup managed function returns an error
 		// gCtx is cancelled. There is no point in copying all the other parts.
 		if gCtx.Err() != nil {
 			break
 		}
 
-		reqSize := remaining
-		if reqSize >= up.chunkSize {
-			reqSize = up.chunkSize
-		}
+		reqSize := min(remaining, up.chunkSize)
 
 		part := part // for the closure
 		g.Go(func() (err error) {

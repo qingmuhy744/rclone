@@ -39,6 +39,14 @@ func Start(ctx context.Context) {
 
 	// Start the transactions per second limiter
 	StartLimitTPS(ctx)
+
+	// Set the error count function pointer up in fs
+	//
+	// We can't do this in an init() method as it uses fs.Config
+	// and that isn't set up then.
+	fs.CountError = func(ctx context.Context, err error) error {
+		return Stats(ctx).Error(err)
+	}
 }
 
 // Account limits and accounts for one transfer
@@ -49,17 +57,18 @@ type Account struct {
 	// in http transport calls Read() after Do() returns on
 	// CancelRequest so this race can happen when it apparently
 	// shouldn't.
-	mu      sync.Mutex // mutex protects these values
-	in      io.Reader
-	ctx     context.Context // current context for transfer - may change
-	ci      *fs.ConfigInfo
-	origIn  io.ReadCloser
-	close   io.Closer
-	size    int64
-	name    string
-	closed  bool          // set if the file is closed
-	exit    chan struct{} // channel that will be closed when transfer is finished
-	withBuf bool          // is using a buffered in
+	mu       sync.Mutex // mutex protects these values
+	in       io.Reader
+	ctx      context.Context // current context for transfer - may change
+	ci       *fs.ConfigInfo
+	origIn   io.ReadCloser
+	close    io.Closer
+	size     int64
+	name     string
+	closed   bool          // set if the file is closed
+	exit     chan struct{} // channel that will be closed when transfer is finished
+	withBuf  bool          // is using a buffered in
+	checking bool          // set if attached transfer is checking
 
 	tokenBucket buckets // per file bandwidth limiter (may be nil)
 
@@ -73,7 +82,7 @@ type accountValues struct {
 	max     int64      // if >=0 the max number of bytes to transfer
 	start   time.Time  // Start time of first read
 	lpTime  time.Time  // Time of last average measurement
-	lpBytes int        // Number of bytes read since last measurement
+	lpBytes int64      // Number of bytes read since last measurement
 	avg     float64    // Moving average of last few measurements in Byte/s
 }
 
@@ -295,14 +304,24 @@ func (acc *Account) ServerSideTransferEnd(n int64) {
 	acc.stats.Bytes(n)
 }
 
-// ServerSideCopyEnd accounts for a read of n bytes in a sever side copy
-func (acc *Account) ServerSideCopyEnd(n int64) {
-	acc.stats.AddServerSideCopy(n)
+// serverSideEnd accounts for non specific server-side data
+func (acc *Account) serverSideEnd(n int64) {
+	// Account for bytes unless we are checking
+	if !acc.checking {
+		acc.stats.BytesNoNetwork(n)
+	}
 }
 
-// ServerSideMoveEnd accounts for a read of n bytes in a sever side move
+// ServerSideCopyEnd accounts for a read of n bytes in a server-side copy
+func (acc *Account) ServerSideCopyEnd(n int64) {
+	acc.stats.AddServerSideCopy(n)
+	acc.serverSideEnd(n)
+}
+
+// ServerSideMoveEnd accounts for a read of n bytes in a server-side move
 func (acc *Account) ServerSideMoveEnd(n int64) {
 	acc.stats.AddServerSideMove(n)
+	acc.serverSideEnd(n)
 }
 
 // DryRun accounts for statistics without running the operation
@@ -325,15 +344,20 @@ func (acc *Account) limitPerFileBandwidth(n int) {
 	}
 }
 
-// Account the read and limit bandwidth
-func (acc *Account) accountRead(n int) {
+// Account the read
+func (acc *Account) accountReadN(n int64) {
 	// Update Stats
 	acc.values.mu.Lock()
 	acc.values.lpBytes += n
-	acc.values.bytes += int64(n)
+	acc.values.bytes += n
 	acc.values.mu.Unlock()
 
-	acc.stats.Bytes(int64(n))
+	acc.stats.Bytes(n)
+}
+
+// Account the read and limit bandwidth
+func (acc *Account) accountRead(n int) {
+	acc.accountReadN(int64(n))
 
 	TokenBucket.LimitBandwidth(TokenBucketSlotAccounting, n)
 	acc.limitPerFileBandwidth(n)
@@ -355,6 +379,39 @@ func (acc *Account) Read(p []byte) (n int, err error) {
 	acc.mu.Lock()
 	defer acc.mu.Unlock()
 	return acc.read(acc.in, p)
+}
+
+// Seek to position in the object - see io.Seeker
+//
+// May return an error if not implemented by the underlying reader.
+func (acc *Account) Seek(offset int64, whence int) (int64, error) {
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	do, ok := acc.in.(io.Seeker)
+	if !ok {
+		return 0, fmt.Errorf("internal error: Seek not implemented for %T", acc.in)
+	}
+	return do.Seek(offset, whence)
+}
+
+// ReadAt from off into p - see io.ReaderAt
+//
+// May return an error if not implemented by the underlying reader.
+func (acc *Account) ReadAt(p []byte, off int64) (n int, err error) {
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	do, ok := acc.in.(io.ReaderAt)
+	if !ok {
+		return 0, fmt.Errorf("internal error: ReadAt not implemented for %T", acc.in)
+	}
+	bytesUntilLimit, err := acc.checkReadBefore()
+	if err == nil {
+		n, err = do.ReadAt(p, off)
+		acc.accountRead(n)
+		n, err = acc.checkReadAfter(bytesUntilLimit, n, err)
+	}
+	return n, err
+
 }
 
 // Thin wrapper for w
@@ -406,6 +463,15 @@ func (acc *Account) AccountRead(n int) (err error) {
 		acc.accountRead(n)
 	}
 	return err
+}
+
+// AccountReadN account having read n bytes
+//
+// Does not obey any transfer limits, bandwidth limits, etc.
+func (acc *Account) AccountReadN(n int64) {
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	acc.accountReadN(n)
 }
 
 // Close the object
@@ -510,7 +576,7 @@ func (acc *Account) String() string {
 	}
 
 	if acc.ci.DataRateUnit == "bits" {
-		cur = cur * 8
+		cur *= 8
 	}
 
 	percentageDone := 0
@@ -528,9 +594,8 @@ func (acc *Account) String() string {
 	)
 }
 
-// rcStats produces remote control stats for this file
-func (acc *Account) rcStats() (out rc.Params) {
-	out = make(rc.Params)
+// rcStats adds remote control stats for this file
+func (acc *Account) rcStats(out rc.Params) {
 	a, b := acc.progress()
 	out["bytes"] = a
 	out["size"] = b
@@ -552,8 +617,6 @@ func (acc *Account) rcStats() (out rc.Params) {
 	}
 	out["percentage"] = percentageDone
 	out["group"] = acc.stats.group
-
-	return out
 }
 
 // OldStream returns the top io.Reader
@@ -595,7 +658,7 @@ func (a *accountStream) SetStream(in io.Reader) {
 	a.in = in
 }
 
-// WrapStream wrap in in an accounter
+// WrapStream wrap in an accounter
 func (a *accountStream) WrapStream(in io.Reader) io.Reader {
 	return a.acc.WrapStream(in)
 }

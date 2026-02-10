@@ -12,15 +12,13 @@ import (
 	"sync"
 	"time"
 
-	sysdnotify "github.com/iguanesolutions/go-systemd/v5/notify"
-
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/rclone/rclone/cmd/mountlib"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/file"
 	"github.com/rclone/rclone/vfs/vfscommon"
-	"github.com/rclone/rclone/vfs/vfsflags"
 )
 
 // Driver implements docker driver api
@@ -46,17 +44,12 @@ func NewDriver(ctx context.Context, root string, mntOpt *mountlib.Options, vfsOp
 		return nil, fmt.Errorf("failed to create cache directory: %s: %w", cacheDir, err)
 	}
 
-	//err = file.MkdirAll(root, 0755)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create mount root: %s: %w", root, err)
-	}
-
 	// setup driver state
 	if mntOpt == nil {
 		mntOpt = &mountlib.Opt
 	}
 	if vfsOpt == nil {
-		vfsOpt = &vfsflags.Opt
+		vfsOpt = &vfscommon.Opt
 	}
 	drv := &Driver{
 		root:      root,
@@ -78,7 +71,6 @@ func NewDriver(ctx context.Context, root string, mntOpt *mountlib.Options, vfsOp
 	// start mount monitoring
 	drv.hupChan = make(chan os.Signal, 1)
 	drv.monChan = make(chan bool, 1)
-	mountlib.NotifyOnSigHup(drv.hupChan)
 	go drv.monitor()
 
 	// unmount all volumes on exit
@@ -87,7 +79,7 @@ func NewDriver(ctx context.Context, root string, mntOpt *mountlib.Options, vfsOp
 	})
 
 	// notify systemd
-	if err := sysdnotify.Ready(); err != nil {
+	if _, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {
 		return nil, fmt.Errorf("failed to notify systemd: %w", err)
 	}
 
@@ -100,7 +92,10 @@ func (drv *Driver) Exit() {
 	drv.mu.Lock()
 	defer drv.mu.Unlock()
 
-	reportErr(sysdnotify.Stopping())
+	reportErr(func() error {
+		_, err := daemon.SdNotify(false, daemon.SdNotifyStopping)
+		return err
+	}())
 	drv.monChan <- true // ask monitor to exit
 	for _, vol := range drv.volumes {
 		reportErr(vol.unmountAll())

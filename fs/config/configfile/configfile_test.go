@@ -2,6 +2,7 @@ package configfile
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -190,7 +191,8 @@ func TestConfigFileReload(t *testing.T) {
 	// Now write a new value on the end
 	out, err := os.OpenFile(config.GetConfigPath(), os.O_APPEND|os.O_WRONLY, 0777)
 	require.NoError(t, err)
-	fmt.Fprintln(out, "appended = what magic")
+	_, err = fmt.Fprintln(out, "appended = what magic")
+	require.NoError(t, err)
 	require.NoError(t, out.Close())
 
 	// And check we magically reloaded it
@@ -359,5 +361,41 @@ func TestConfigFileSaveSymlinkAbsolute(t *testing.T) {
 		target := filepath.Join("b", "c", "configfiletarget")
 		resolvedTarget := filepath.Join(filepath.Dir(link), target)
 		testSymlink(t, link, target, resolvedTarget)
+	})
+}
+
+type pipedInput struct {
+	io.Reader
+}
+
+func (p *pipedInput) Read(b []byte) (int, error) {
+	return p.Reader.Read(b)
+}
+
+func (*pipedInput) Seek(int64, int) (int64, error) {
+	return 0, fmt.Errorf("Seek not supported")
+}
+
+func TestPipedConfig(t *testing.T) {
+	t.Run("DoesNotSupportSeeking", func(t *testing.T) {
+		r := &pipedInput{strings.NewReader("")}
+		_, err := r.Seek(0, io.SeekStart)
+		require.Error(t, err)
+	})
+
+	t.Run("IsSupported", func(t *testing.T) {
+		r := &pipedInput{strings.NewReader(configData)}
+		_, err := config.Decrypt(r)
+		require.NoError(t, err)
+	})
+
+	t.Run("PlainTextConfigIsNotConsumedByCryptCheck", func(t *testing.T) {
+		in := &pipedInput{strings.NewReader(configData)}
+
+		r, _ := config.Decrypt(in)
+		got, err := io.ReadAll(r)
+		require.NoError(t, err)
+
+		assert.Equal(t, configData, string(got))
 	})
 }

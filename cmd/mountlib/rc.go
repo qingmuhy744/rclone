@@ -3,14 +3,13 @@ package mountlib
 import (
 	"context"
 	"errors"
-	"log"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/rc"
-	"github.com/rclone/rclone/vfs/vfsflags"
+	"github.com/rclone/rclone/vfs/vfscommon"
 )
 
 var (
@@ -66,14 +65,18 @@ This takes the following parameters:
 
 Example:
 
-    rclone rc mount/mount fs=mydrive: mountPoint=/home/<user>/mountPoint
-    rclone rc mount/mount fs=mydrive: mountPoint=/home/<user>/mountPoint mountType=mount
-    rclone rc mount/mount fs=TestDrive: mountPoint=/mnt/tmp vfsOpt='{"CacheMode": 2}' mountOpt='{"AllowOther": true}'
+` + "```console" + `
+rclone rc mount/mount fs=mydrive: mountPoint=/home/<user>/mountPoint
+rclone rc mount/mount fs=mydrive: mountPoint=/home/<user>/mountPoint mountType=mount
+rclone rc mount/mount fs=TestDrive: mountPoint=/mnt/tmp vfsOpt='{"CacheMode": 2}' mountOpt='{"AllowOther": true}'
+` + "```" + `
 
-The vfsOpt are as described in options/get and can be seen in the the
+The vfsOpt are as described in options/get and can be seen in the
 "vfs" section when running and the mountOpt can be seen in the "mount" section:
 
-    rclone rc options/get
+` + "```console" + `
+rclone rc options/get
+` + "```" + `
 `,
 	})
 }
@@ -85,7 +88,7 @@ func mountRc(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 		return nil, err
 	}
 
-	vfsOpt := vfsflags.Opt
+	vfsOpt := vfscommon.Opt
 	err = in.GetStructMissingOK("vfsOpt", &vfsOpt)
 	if err != nil {
 		return nil, err
@@ -123,12 +126,12 @@ func mountRc(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	mnt := NewMountPoint(mountFn, mountPoint, fdst, &mountOpt, &vfsOpt)
 	_, err = mnt.Mount()
 	if err != nil {
-		log.Printf("mount FAILED: %v", err)
+		fs.Logf(nil, "mount FAILED: %v", err)
 		return nil, err
 	}
 	go func() {
 		if err = mnt.Wait(); err != nil {
-			log.Printf("unmount FAILED: %v", err)
+			fs.Logf(nil, "unmount FAILED: %v", err)
 			return
 		}
 		mountMu.Lock()

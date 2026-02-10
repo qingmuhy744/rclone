@@ -150,19 +150,19 @@ func TestAsyncReaderSizes(t *testing.T) {
 
 	var texts [31]string
 	str := ""
-	all := ""
-	for i := 0; i < len(texts)-1; i++ {
+	var all strings.Builder
+	for i := range len(texts) - 1 {
 		texts[i] = str + "\n"
-		all += texts[i]
+		all.WriteString(texts[i])
 		str += string(rune(i)%26 + 'a')
 	}
-	texts[len(texts)-1] = all
+	texts[len(texts)-1] = all.String()
 
-	for h := 0; h < len(texts); h++ {
+	for h := range len(texts) {
 		text := texts[h]
-		for i := 0; i < len(readMakers); i++ {
-			for j := 0; j < len(bufreaders); j++ {
-				for k := 0; k < len(bufsizes); k++ {
+		for i := range readMakers {
+			for j := range bufreaders {
+				for k := range bufsizes {
 					for l := 1; l < 10; l++ {
 						readmaker := readMakers[i]
 						bufreader := bufreaders[j]
@@ -191,19 +191,19 @@ func TestAsyncReaderWriteTo(t *testing.T) {
 
 	var texts [31]string
 	str := ""
-	all := ""
-	for i := 0; i < len(texts)-1; i++ {
+	var all strings.Builder
+	for i := range len(texts) - 1 {
 		texts[i] = str + "\n"
-		all += texts[i]
+		all.WriteString(texts[i])
 		str += string(rune(i)%26 + 'a')
 	}
-	texts[len(texts)-1] = all
+	texts[len(texts)-1] = all.String()
 
-	for h := 0; h < len(texts); h++ {
+	for h := range len(texts) {
 		text := texts[h]
-		for i := 0; i < len(readMakers); i++ {
-			for j := 0; j < len(bufreaders); j++ {
-				for k := 0; k < len(bufsizes); k++ {
+		for i := range readMakers {
+			for j := range bufreaders {
+				for k := range bufsizes {
 					for l := 1; l < 10; l++ {
 						readmaker := readMakers[i]
 						bufreader := bufreaders[j]

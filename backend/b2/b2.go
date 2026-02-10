@@ -8,7 +8,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha1"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +18,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +33,8 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
-	"github.com/rclone/rclone/fs/walk"
+	"github.com/rclone/rclone/fs/list"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/bucket"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/multipart"
@@ -51,6 +55,9 @@ const (
 	nameHeader          = "X-Bz-File-Name"
 	timestampHeader     = "X-Bz-Upload-Timestamp"
 	retryAfterHeader    = "Retry-After"
+	sseAlgorithmHeader  = "X-Bz-Server-Side-Encryption-Customer-Algorithm"
+	sseKeyHeader        = "X-Bz-Server-Side-Encryption-Customer-Key"
+	sseMd5Header        = "X-Bz-Server-Side-Encryption-Customer-Key-Md5"
 	minSleep            = 10 * time.Millisecond
 	maxSleep            = 5 * time.Minute
 	decayConstant       = 1 // bigger for slower decay, exponential
@@ -60,11 +67,12 @@ const (
 	defaultChunkSize    = 96 * fs.Mebi
 	defaultUploadCutoff = 200 * fs.Mebi
 	largeFileCopyCutoff = 4 * fs.Gibi // 5E9 is the max
+	defaultMaxAge       = 24 * time.Hour
 )
 
 // Globals
 var (
-	errNotWithVersions  = errors.New("can't modify or delete files in --b2-versions mode")
+	errNotWithVersions  = errors.New("can't modify files in --b2-versions mode")
 	errNotWithVersionAt = errors.New("can't modify or delete files in --b2-version-at mode")
 )
 
@@ -101,7 +109,7 @@ below will cause b2 to return specific errors:
   * "force_cap_exceeded"
 
 These will be set in the "X-Bz-Test-Mode" header which is documented
-in the [b2 integrations checklist](https://www.backblaze.com/b2/docs/integration_checklist.html).`,
+in the [b2 integrations checklist](https://www.backblaze.com/docs/cloud-storage-integration-checklist).`,
 			Default:  "",
 			Hide:     fs.OptionHideConfigurator,
 			Advanced: true,
@@ -193,9 +201,12 @@ Example:
 			Advanced: true,
 		}, {
 			Name: "download_auth_duration",
-			Help: `Time before the authorization token will expire in s or suffix ms|s|m|h|d.
+			Help: `Time before the public link authorization token will expire in s or suffix ms|s|m|h|d.
 
-The duration before the download authorization token will expire.
+This is used in combination with "rclone link" for making files
+accessible to the public and sets the duration before the download
+authorization token will expire.
+
 The minimum value is 1 second. The maximum value is one week.`,
 			Default:  fs.Duration(7 * 24 * time.Hour),
 			Advanced: true,
@@ -240,12 +251,57 @@ See: [rclone backend lifecycle](#lifecycle) for setting lifecycles after bucket 
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
-			// See: https://www.backblaze.com/b2/docs/files.html
+			// See: https://www.backblaze.com/docs/cloud-storage-files
 			// Encode invalid UTF-8 bytes as json doesn't handle them properly.
 			// FIXME: allow /, but not leading, trailing or double
 			Default: (encoder.Display |
 				encoder.EncodeBackSlash |
 				encoder.EncodeInvalidUtf8),
+		}, {
+			Name:     "sse_customer_algorithm",
+			Help:     "If using SSE-C, the server-side encryption algorithm used when storing this object in B2.",
+			Advanced: true,
+			Examples: []fs.OptionExample{{
+				Value: "",
+				Help:  "None",
+			}, {
+				Value: "AES256",
+				Help:  "Advanced Encryption Standard (256 bits key length)",
+			}},
+		}, {
+			Name: "sse_customer_key",
+			Help: `To use SSE-C, you may provide the secret encryption key encoded in a UTF-8 compatible string to encrypt/decrypt your data
+
+Alternatively you can provide --sse-customer-key-base64.`,
+			Advanced: true,
+			Examples: []fs.OptionExample{{
+				Value: "",
+				Help:  "None",
+			}},
+			Sensitive: true,
+		}, {
+			Name: "sse_customer_key_base64",
+			Help: `To use SSE-C, you may provide the secret encryption key encoded in Base64 format to encrypt/decrypt your data
+
+Alternatively you can provide --sse-customer-key.`,
+			Advanced: true,
+			Examples: []fs.OptionExample{{
+				Value: "",
+				Help:  "None",
+			}},
+			Sensitive: true,
+		}, {
+			Name: "sse_customer_key_md5",
+			Help: `If using SSE-C you may provide the secret encryption key MD5 checksum (optional).
+
+If you leave it blank, this is calculated automatically from the sse_customer_key provided.
+`,
+			Advanced: true,
+			Examples: []fs.OptionExample{{
+				Value: "",
+				Help:  "None",
+			}},
+			Sensitive: true,
 		}},
 	})
 }
@@ -268,6 +324,10 @@ type Options struct {
 	DownloadAuthorizationDuration fs.Duration          `config:"download_auth_duration"`
 	Lifecycle                     int                  `config:"lifecycle"`
 	Enc                           encoder.MultiEncoder `config:"encoding"`
+	SSECustomerAlgorithm          string               `config:"sse_customer_algorithm"`
+	SSECustomerKey                string               `config:"sse_customer_key"`
+	SSECustomerKeyBase64          string               `config:"sse_customer_key_base64"`
+	SSECustomerKeyMD5             string               `config:"sse_customer_key_md5"`
 }
 
 // Fs represents a remote b2 server
@@ -359,7 +419,7 @@ var retryErrorCodes = []int{
 	504, // Gateway Time-out
 }
 
-// shouldRetryNoAuth returns a boolean as to whether this resp and err
+// shouldRetryNoReauth returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
 func (f *Fs) shouldRetryNoReauth(ctx context.Context, resp *http.Response, err error) (bool, error) {
 	if fserrors.ContextError(ctx, &err) {
@@ -498,6 +558,24 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if opt.Endpoint == "" {
 		opt.Endpoint = defaultEndpoint
 	}
+	if opt.SSECustomerKey != "" && opt.SSECustomerKeyBase64 != "" {
+		return nil, errors.New("b2: can't use both sse_customer_key and sse_customer_key_base64 at the same time")
+	} else if opt.SSECustomerKeyBase64 != "" {
+		// Decode the Base64-encoded key and store it in the SSECustomerKey field
+		decoded, err := base64.StdEncoding.DecodeString(opt.SSECustomerKeyBase64)
+		if err != nil {
+			return nil, fmt.Errorf("b2: Could not decode sse_customer_key_base64: %w", err)
+		}
+		opt.SSECustomerKey = string(decoded)
+	} else {
+		// Encode the raw key as Base64
+		opt.SSECustomerKeyBase64 = base64.StdEncoding.EncodeToString([]byte(opt.SSECustomerKey))
+	}
+	if opt.SSECustomerKey != "" && opt.SSECustomerKeyMD5 == "" {
+		// Calculate CustomerKeyMd5 if not supplied
+		md5sumBinary := md5.Sum([]byte(opt.SSECustomerKey))
+		opt.SSECustomerKeyMD5 = base64.StdEncoding.EncodeToString(md5sumBinary[:])
+	}
 	ci := fs.GetConfig(ctx)
 	f := &Fs{
 		name:        name,
@@ -529,17 +607,29 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		return nil, fmt.Errorf("failed to authorize account: %w", err)
 	}
-	// If this is a key limited to a single bucket, it must exist already
-	if f.rootBucket != "" && f.info.Allowed.BucketID != "" {
-		allowedBucket := f.opt.Enc.ToStandardName(f.info.Allowed.BucketName)
-		if allowedBucket == "" {
-			return nil, errors.New("bucket that application key is restricted to no longer exists")
+	// If this is a key limited to one or more buckets, one of them must exist
+	// and be ours.
+	if f.rootBucket != "" && len(f.info.APIs.Storage.Allowed.Buckets) != 0 {
+		buckets := f.info.APIs.Storage.Allowed.Buckets
+		var rootFound = false
+		var rootID string
+		for _, b := range buckets {
+			allowedBucket := f.opt.Enc.ToStandardName(b.Name)
+			if allowedBucket == "" {
+				fs.Debugf(f, "bucket %q that application key is restricted to no longer exists", b.ID)
+				continue
+			}
+
+			if allowedBucket == f.rootBucket {
+				rootFound = true
+				rootID = b.ID
+			}
 		}
-		if allowedBucket != f.rootBucket {
-			return nil, fmt.Errorf("you must use bucket %q with this application key", allowedBucket)
+		if !rootFound {
+			return nil, fmt.Errorf("you must use bucket(s) %q with this application key", buckets)
 		}
 		f.cache.MarkOK(f.rootBucket)
-		f.setBucketID(f.rootBucket, f.info.Allowed.BucketID)
+		f.setBucketID(f.rootBucket, rootID)
 	}
 	if f.rootBucket != "" && f.rootDirectory != "" {
 		// Check to see if the (bucket,directory) is actually an existing file
@@ -565,7 +655,7 @@ func (f *Fs) authorizeAccount(ctx context.Context) error {
 	defer f.authMu.Unlock()
 	opts := rest.Opts{
 		Method:       "GET",
-		Path:         "/b2api/v1/b2_authorize_account",
+		Path:         "/b2api/v4/b2_authorize_account",
 		RootURL:      f.opt.Endpoint,
 		UserName:     f.opt.Account,
 		Password:     f.opt.Key,
@@ -578,18 +668,13 @@ func (f *Fs) authorizeAccount(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to authenticate: %w", err)
 	}
-	f.srv.SetRoot(f.info.APIURL+"/b2api/v1").SetHeader("Authorization", f.info.AuthorizationToken)
+	f.srv.SetRoot(f.info.APIs.Storage.APIURL+"/b2api/v1").SetHeader("Authorization", f.info.AuthorizationToken)
 	return nil
 }
 
 // hasPermission returns if the current AuthorizationToken has the selected permission
 func (f *Fs) hasPermission(permission string) bool {
-	for _, capability := range f.info.Allowed.Capabilities {
-		if capability == permission {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(f.info.APIs.Storage.Allowed.Capabilities, permission)
 }
 
 // getUploadURL returns the upload info with the UploadURL and the AuthorizationToken
@@ -846,7 +931,7 @@ func (f *Fs) itemToDirEntry(ctx context.Context, remote string, object *api.File
 }
 
 // listDir lists a single directory
-func (f *Fs) listDir(ctx context.Context, bucket, directory, prefix string, addBucket bool) (entries fs.DirEntries, err error) {
+func (f *Fs) listDir(ctx context.Context, bucket, directory, prefix string, addBucket bool, callback func(fs.DirEntry) error) (err error) {
 	last := ""
 	err = f.list(ctx, bucket, directory, prefix, f.rootBucket == "", false, 0, f.opt.Versions, false, func(remote string, object *api.File, isDirectory bool) error {
 		entry, err := f.itemToDirEntry(ctx, remote, object, isDirectory, &last)
@@ -854,16 +939,16 @@ func (f *Fs) listDir(ctx context.Context, bucket, directory, prefix string, addB
 			return err
 		}
 		if entry != nil {
-			entries = append(entries, entry)
+			return callback(entry)
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// bucket must be present if listing succeeded
 	f.cache.MarkOK(bucket)
-	return entries, nil
+	return nil
 }
 
 // listBuckets returns all the buckets to out
@@ -889,14 +974,46 @@ func (f *Fs) listBuckets(ctx context.Context) (entries fs.DirEntries, err error)
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	return list.WithListP(ctx, dir, f)
+}
+
+// ListP lists the objects and directories of the Fs starting
+// from dir non recursively into out.
+//
+// dir should be "" to start from the root, and should not
+// have trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+//
+// It should call callback for each tranche of entries read.
+// These need not be returned in any particular order.  If
+// callback returns an error then the listing will stop
+// immediately.
+func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) error {
+	list := list.NewHelper(callback)
 	bucket, directory := f.split(dir)
 	if bucket == "" {
 		if directory != "" {
-			return nil, fs.ErrorListBucketRequired
+			return fs.ErrorListBucketRequired
 		}
-		return f.listBuckets(ctx)
+		entries, err := f.listBuckets(ctx)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			err = list.Add(entry)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		err := f.listDir(ctx, bucket, directory, f.rootDirectory, f.rootBucket == "", list.Add)
+		if err != nil {
+			return err
+		}
 	}
-	return f.listDir(ctx, bucket, directory, f.rootDirectory, f.rootBucket == "")
+	return list.Flush()
 }
 
 // ListR lists the objects and directories of the Fs starting
@@ -917,7 +1034,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // of listing recursively that doing a directory traversal.
 func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (err error) {
 	bucket, directory := f.split(dir)
-	list := walk.NewListRHelper(callback)
+	list := list.NewHelper(callback)
 	listR := func(bucket, directory, prefix string, addBucket bool) error {
 		last := ""
 		return f.list(ctx, bucket, directory, prefix, addBucket, true, 0, f.opt.Versions, false, func(remote string, object *api.File, isDirectory bool) error {
@@ -962,44 +1079,83 @@ type listBucketFn func(*api.Bucket) error
 
 // listBucketsToFn lists the buckets to the function supplied
 func (f *Fs) listBucketsToFn(ctx context.Context, bucketName string, fn listBucketFn) error {
-	var account = api.ListBucketsRequest{
-		AccountID: f.info.AccountID,
-		BucketID:  f.info.Allowed.BucketID,
-	}
-	if bucketName != "" && account.BucketID == "" {
-		account.BucketName = f.opt.Enc.FromStandardName(bucketName)
+	responses := make([]api.ListBucketsResponse, len(f.info.APIs.Storage.Allowed.Buckets))[:0]
+
+	call := func(id string) error {
+		var account = api.ListBucketsRequest{
+			AccountID: f.info.AccountID,
+			BucketID:  id,
+		}
+		if bucketName != "" && account.BucketID == "" {
+			account.BucketName = f.opt.Enc.FromStandardName(bucketName)
+		}
+
+		var response api.ListBucketsResponse
+		opts := rest.Opts{
+			Method: "POST",
+			Path:   "/b2_list_buckets",
+		}
+		err := f.pacer.Call(func() (bool, error) {
+			resp, err := f.srv.CallJSON(ctx, &opts, &account, &response)
+			return f.shouldRetry(ctx, resp, err)
+		})
+		if err != nil {
+			return err
+		}
+		responses = append(responses, response)
+		return nil
 	}
 
-	var response api.ListBucketsResponse
-	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/b2_list_buckets",
+	for i := range f.info.APIs.Storage.Allowed.Buckets {
+		b := &f.info.APIs.Storage.Allowed.Buckets[i]
+		// Empty names indicate a bucket that no longer exists, this is non-fatal
+		// for multi-bucket API keys.
+		if b.Name == "" {
+			continue
+		}
+		// When requesting a specific bucket skip over non-matching names
+		if bucketName != "" && b.Name != bucketName {
+			continue
+		}
+
+		err := call(b.ID)
+		if err != nil {
+			return err
+		}
 	}
-	err := f.pacer.Call(func() (bool, error) {
-		resp, err := f.srv.CallJSON(ctx, &opts, &account, &response)
-		return f.shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		return err
+
+	if len(f.info.APIs.Storage.Allowed.Buckets) == 0 {
+		err := call("")
+		if err != nil {
+			return err
+		}
 	}
+
 	f.bucketIDMutex.Lock()
 	f.bucketTypeMutex.Lock()
 	f._bucketID = make(map[string]string, 1)
 	f._bucketType = make(map[string]string, 1)
-	for i := range response.Buckets {
-		bucket := &response.Buckets[i]
-		bucket.Name = f.opt.Enc.ToStandardName(bucket.Name)
-		f.cache.MarkOK(bucket.Name)
-		f._bucketID[bucket.Name] = bucket.ID
-		f._bucketType[bucket.Name] = bucket.Type
+
+	for ri := range responses {
+		response := &responses[ri]
+		for i := range response.Buckets {
+			bucket := &response.Buckets[i]
+			bucket.Name = f.opt.Enc.ToStandardName(bucket.Name)
+			f.cache.MarkOK(bucket.Name)
+			f._bucketID[bucket.Name] = bucket.ID
+			f._bucketType[bucket.Name] = bucket.Type
+		}
 	}
 	f.bucketTypeMutex.Unlock()
 	f.bucketIDMutex.Unlock()
-	for i := range response.Buckets {
-		bucket := &response.Buckets[i]
-		err = fn(bucket)
-		if err != nil {
-			return err
+	for ri := range responses {
+		response := &responses[ri]
+		for i := range response.Buckets {
+			bucket := &response.Buckets[i]
+			err := fn(bucket)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1245,7 +1401,7 @@ func (f *Fs) deleteByID(ctx context.Context, ID, Name string) error {
 // if oldOnly is true then it deletes only non current files.
 //
 // Implemented here so we can make sure we delete old versions.
-func (f *Fs) purge(ctx context.Context, dir string, oldOnly bool) error {
+func (f *Fs) purge(ctx context.Context, dir string, oldOnly bool, deleteHidden bool, deleteUnfinished bool, maxAge time.Duration) error {
 	bucket, directory := f.split(dir)
 	if bucket == "" {
 		return errors.New("can't purge from root")
@@ -1263,14 +1419,14 @@ func (f *Fs) purge(ctx context.Context, dir string, oldOnly bool) error {
 		}
 	}
 	var isUnfinishedUploadStale = func(timestamp api.Timestamp) bool {
-		return time.Since(time.Time(timestamp)).Hours() > 24
+		return time.Since(time.Time(timestamp)) > maxAge
 	}
 
 	// Delete Config.Transfers in parallel
 	toBeDeleted := make(chan *api.File, f.ci.Transfers)
 	var wg sync.WaitGroup
 	wg.Add(f.ci.Transfers)
-	for i := 0; i < f.ci.Transfers; i++ {
+	for range f.ci.Transfers {
 		go func() {
 			defer wg.Done()
 			for object := range toBeDeleted {
@@ -1286,6 +1442,21 @@ func (f *Fs) purge(ctx context.Context, dir string, oldOnly bool) error {
 			}
 		}()
 	}
+	if oldOnly {
+		if deleteHidden && deleteUnfinished {
+			fs.Infof(f, "cleaning bucket %q of all hidden files, and pending multipart uploads older than %v", bucket, maxAge)
+		} else if deleteHidden {
+			fs.Infof(f, "cleaning bucket %q of all hidden files", bucket)
+		} else if deleteUnfinished {
+			fs.Infof(f, "cleaning bucket %q of pending multipart uploads older than %v", bucket, maxAge)
+		} else {
+			fs.Errorf(f, "cleaning bucket %q of nothing. This should never happen!", bucket)
+			return nil
+		}
+	} else {
+		fs.Infof(f, "cleaning bucket %q of all files", bucket)
+	}
+
 	last := ""
 	checkErr(f.list(ctx, bucket, directory, f.rootDirectory, f.rootBucket == "", true, 0, true, false, func(remote string, object *api.File, isDirectory bool) error {
 		if !isDirectory {
@@ -1296,18 +1467,24 @@ func (f *Fs) purge(ctx context.Context, dir string, oldOnly bool) error {
 			tr := accounting.Stats(ctx).NewCheckingTransfer(oi, "checking")
 			if oldOnly && last != remote {
 				// Check current version of the file
-				if object.Action == "hide" {
+				if deleteHidden && object.Action == "hide" {
 					fs.Debugf(remote, "Deleting current version (id %q) as it is a hide marker", object.ID)
-					toBeDeleted <- object
-				} else if object.Action == "start" && isUnfinishedUploadStale(object.UploadTimestamp) {
+					if !operations.SkipDestructive(ctx, object.Name, "remove hide marker") {
+						toBeDeleted <- object
+					}
+				} else if deleteUnfinished && object.Action == "start" && isUnfinishedUploadStale(object.UploadTimestamp) {
 					fs.Debugf(remote, "Deleting current version (id %q) as it is a start marker (upload started at %s)", object.ID, time.Time(object.UploadTimestamp).Local())
-					toBeDeleted <- object
+					if !operations.SkipDestructive(ctx, object.Name, "remove pending upload") {
+						toBeDeleted <- object
+					}
 				} else {
-					fs.Debugf(remote, "Not deleting current version (id %q) %q", object.ID, object.Action)
+					fs.Debugf(remote, "Not deleting current version (id %q) %q dated %v (%v ago)", object.ID, object.Action, time.Time(object.UploadTimestamp).Local(), time.Since(time.Time(object.UploadTimestamp)))
 				}
 			} else {
 				fs.Debugf(remote, "Deleting (id %q)", object.ID)
-				toBeDeleted <- object
+				if !operations.SkipDestructive(ctx, object.Name, "delete") {
+					toBeDeleted <- object
+				}
 			}
 			last = remote
 			tr.Done(ctx, nil)
@@ -1325,12 +1502,17 @@ func (f *Fs) purge(ctx context.Context, dir string, oldOnly bool) error {
 
 // Purge deletes all the files and directories including the old versions.
 func (f *Fs) Purge(ctx context.Context, dir string) error {
-	return f.purge(ctx, dir, false)
+	return f.purge(ctx, dir, false, false, false, defaultMaxAge)
 }
 
-// CleanUp deletes all the hidden files.
+// CleanUp deletes all hidden files and pending multipart uploads older than 24 hours.
 func (f *Fs) CleanUp(ctx context.Context) error {
-	return f.purge(ctx, "", true)
+	return f.purge(ctx, "", true, true, true, defaultMaxAge)
+}
+
+// cleanUp deletes all hidden files and/or pending multipart uploads older than the specified age.
+func (f *Fs) cleanUp(ctx context.Context, deleteHidden bool, deleteUnfinished bool, maxAge time.Duration) (err error) {
+	return f.purge(ctx, "", true, deleteHidden, deleteUnfinished, maxAge)
 }
 
 // copy does a server-side copy from dstObj <- srcObj
@@ -1375,6 +1557,16 @@ func (f *Fs) copy(ctx context.Context, dstObj *Object, srcObj *Object, newInfo *
 		SourceID:     srcObj.id,
 		Name:         f.opt.Enc.FromStandardPath(dstPath),
 		DestBucketID: destBucketID,
+	}
+	if f.opt.SSECustomerKey != "" && f.opt.SSECustomerKeyMD5 != "" {
+		serverSideEncryptionConfig := api.ServerSideEncryption{
+			Mode:           "SSE-C",
+			Algorithm:      f.opt.SSECustomerAlgorithm,
+			CustomerKey:    f.opt.SSECustomerKeyBase64,
+			CustomerKeyMd5: f.opt.SSECustomerKeyMD5,
+		}
+		request.SourceServerSideEncryption = &serverSideEncryptionConfig
+		request.DestinationServerSideEncryption = &serverSideEncryptionConfig
 	}
 	if newInfo == nil {
 		request.MetadataDirective = "COPY"
@@ -1465,7 +1657,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	bucket, bucketPath := f.split(remote)
 	var RootURL string
 	if f.opt.DownloadURL == "" {
-		RootURL = f.info.DownloadURL
+		RootURL = f.info.APIs.Storage.DownloadURL
 	} else {
 		RootURL = f.opt.DownloadURL
 	}
@@ -1542,7 +1734,7 @@ func (o *Object) Size() int64 {
 //
 // Make sure it is lower case.
 //
-// Remove unverified prefix - see https://www.backblaze.com/b2/docs/uploading.html
+// Remove unverified prefix - see https://www.backblaze.com/docs/cloud-storage-upload-files-with-the-native-api
 // Some tools (e.g. Cyberduck) use this
 func cleanSHA1(sha1 string) string {
 	const unverified = "unverified:"
@@ -1569,7 +1761,11 @@ func (o *Object) decodeMetaDataRaw(ID, SHA1 string, Size int64, UploadTimestamp 
 	o.size = Size
 	// Use the UploadTimestamp if can't get file info
 	o.modTime = time.Time(UploadTimestamp)
-	return o.parseTimeString(Info[timeKey])
+	err = o.parseTimeString(Info[timeKey])
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // decodeMetaData sets the metadata in the object from an api.File
@@ -1642,6 +1838,21 @@ func (o *Object) getMetaData(ctx context.Context) (info *api.File, err error) {
 			return o.getMetaDataListing(ctx)
 		}
 	}
+
+	// If using versionAt we need to list the find the correct version.
+	if o.fs.opt.VersionAt.IsSet() {
+		info, err := o.getMetaDataListing(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		if info.Action == "hide" {
+			// Rerturn object not found error if the current version is deleted.
+			return nil, fs.ErrorObjectNotFound
+		}
+		return info, nil
+	}
+
 	_, info, err = o.getOrHead(ctx, "HEAD", nil)
 	return info, err
 }
@@ -1671,6 +1882,16 @@ func timeString(modTime time.Time) string {
 	return strconv.FormatInt(modTime.UnixNano()/1e6, 10)
 }
 
+// parseTimeStringHelper converts a decimal string number of milliseconds
+// elapsed since January 1, 1970 UTC into a time.Time
+func parseTimeStringHelper(timeString string) (time.Time, error) {
+	unixMilliseconds, err := strconv.ParseInt(timeString, 10, 64)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(unixMilliseconds/1e3, (unixMilliseconds%1e3)*1e6).UTC(), nil
+}
+
 // parseTimeString converts a decimal string number of milliseconds
 // elapsed since January 1, 1970 UTC into a time.Time and stores it in
 // the modTime variable.
@@ -1678,12 +1899,12 @@ func (o *Object) parseTimeString(timeString string) (err error) {
 	if timeString == "" {
 		return nil
 	}
-	unixMilliseconds, err := strconv.ParseInt(timeString, 10, 64)
+	modTime, err := parseTimeStringHelper(timeString)
 	if err != nil {
 		fs.Debugf(o, "Failed to parse mod time string %q: %v", timeString, err)
 		return nil
 	}
-	o.modTime = time.Unix(unixMilliseconds/1e3, (unixMilliseconds%1e3)*1e6).UTC()
+	o.modTime = modTime
 	return nil
 }
 
@@ -1760,14 +1981,14 @@ func (file *openFile) Close() (err error) {
 
 	// Check to see we read the correct number of bytes
 	if file.o.Size() != file.bytes {
-		return fmt.Errorf("object corrupted on transfer - length mismatch (want %d got %d)", file.o.Size(), file.bytes)
+		return fmt.Errorf("corrupted on transfer: lengths differ want %d vs got %d", file.o.Size(), file.bytes)
 	}
 
 	// Check the SHA1
 	receivedSHA1 := file.o.sha1
 	calculatedSHA1 := fmt.Sprintf("%x", file.hash.Sum(nil))
 	if receivedSHA1 != "" && receivedSHA1 != calculatedSHA1 {
-		return fmt.Errorf("object corrupted on transfer - SHA1 mismatch (want %q got %q)", receivedSHA1, calculatedSHA1)
+		return fmt.Errorf("corrupted on transfer: SHA1 hashes differ want %q vs got %q", receivedSHA1, calculatedSHA1)
 	}
 
 	return nil
@@ -1778,15 +1999,16 @@ var _ io.ReadCloser = &openFile{}
 
 func (o *Object) getOrHead(ctx context.Context, method string, options []fs.OpenOption) (resp *http.Response, info *api.File, err error) {
 	opts := rest.Opts{
-		Method:     method,
-		Options:    options,
-		NoResponse: method == "HEAD",
+		Method:       method,
+		Options:      options,
+		NoResponse:   method == "HEAD",
+		ExtraHeaders: map[string]string{},
 	}
 
 	// Use downloadUrl from backblaze if downloadUrl is not set
 	// otherwise use the custom downloadUrl
 	if o.fs.opt.DownloadURL == "" {
-		opts.RootURL = o.fs.info.DownloadURL
+		opts.RootURL = o.fs.info.APIs.Storage.DownloadURL
 	} else {
 		opts.RootURL = o.fs.opt.DownloadURL
 	}
@@ -1797,6 +2019,11 @@ func (o *Object) getOrHead(ctx context.Context, method string, options []fs.Open
 	} else {
 		bucket, bucketPath := o.split()
 		opts.Path += "/file/" + urlEncode(o.fs.opt.Enc.FromStandardName(bucket)) + "/" + urlEncode(o.fs.opt.Enc.FromStandardPath(bucketPath))
+	}
+	if o.fs.opt.SSECustomerKey != "" && o.fs.opt.SSECustomerKeyMD5 != "" {
+		opts.ExtraHeaders[sseAlgorithmHeader] = o.fs.opt.SSECustomerAlgorithm
+		opts.ExtraHeaders[sseKeyHeader] = o.fs.opt.SSECustomerKeyBase64
+		opts.ExtraHeaders[sseMd5Header] = o.fs.opt.SSECustomerKeyMD5
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
@@ -1837,12 +2064,18 @@ func (o *Object) getOrHead(ctx context.Context, method string, options []fs.Open
 		ContentType:     resp.Header.Get("Content-Type"),
 		Info:            Info,
 	}
+
 	// When reading files from B2 via cloudflare using
 	// --b2-download-url cloudflare strips the Content-Length
 	// headers (presumably so it can inject stuff) so use the old
 	// length read from the listing.
+	// Additionally, the official examples return S3 headers
+	// instead of native, i.e. no file ID, use ones from listing.
 	if info.Size < 0 {
 		info.Size = o.size
+	}
+	if info.ID == "" {
+		info.ID = o.id
 	}
 	return resp, info, nil
 }
@@ -1893,7 +2126,7 @@ func init() {
 // urlEncode encodes in with % encoding
 func urlEncode(in string) string {
 	var out bytes.Buffer
-	for i := 0; i < len(in); i++ {
+	for i := range len(in) {
 		c := in[i]
 		if noNeedToEncode[c] {
 			_ = out.WriteByte(c)
@@ -1934,7 +2167,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 		if err == nil {
 			fs.Debugf(o, "File is big enough for chunked streaming")
-			up, err := o.fs.newLargeUpload(ctx, o, in, src, o.fs.opt.ChunkSize, false, nil)
+			up, err := o.fs.newLargeUpload(ctx, o, in, src, o.fs.opt.ChunkSize, false, nil, options...)
 			if err != nil {
 				o.fs.putRW(rw)
 				return err
@@ -1966,7 +2199,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return o.decodeMetaDataFileInfo(up.info)
 	}
 
-	modTime := src.ModTime(ctx)
+	modTime, err := o.getModTime(ctx, src, options)
+	if err != nil {
+		return err
+	}
 
 	calculatedSha1, _ := src.Hash(ctx, hash.SHA1)
 	if calculatedSha1 == "" {
@@ -2053,6 +2289,11 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		},
 		ContentLength: &size,
 	}
+	if o.fs.opt.SSECustomerKey != "" && o.fs.opt.SSECustomerKeyMD5 != "" {
+		opts.ExtraHeaders[sseAlgorithmHeader] = o.fs.opt.SSECustomerAlgorithm
+		opts.ExtraHeaders[sseKeyHeader] = o.fs.opt.SSECustomerKeyBase64
+		opts.ExtraHeaders[sseMd5Header] = o.fs.opt.SSECustomerKeyMD5
+	}
 	var response api.FileInfo
 	// Don't retry, return a retry error instead
 	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
@@ -2069,6 +2310,36 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 	return o.decodeMetaDataFileInfo(&response)
+}
+
+// Get modTime from the source; if --metadata is set, fetch the src metadata and get it from there.
+// When metadata support is added to b2, this method will need a more generic name
+func (o *Object) getModTime(ctx context.Context, src fs.ObjectInfo, options []fs.OpenOption) (time.Time, error) {
+	modTime := src.ModTime(ctx)
+
+	// Fetch metadata if --metadata is in use
+	meta, err := fs.GetMetadataOptions(ctx, o.fs, src, options)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to read metadata from source object: %w", err)
+	}
+	// merge metadata into request and user metadata
+	for k, v := range meta {
+		k = strings.ToLower(k)
+		// For now, the only metadata we're concerned with is "mtime"
+		switch k {
+		case "mtime":
+			// mtime in meta overrides source ModTime
+			metaModTime, err := time.Parse(time.RFC3339Nano, v)
+			if err != nil {
+				fs.Debugf(o, "failed to parse metadata %s: %q: %v", k, v, err)
+			} else {
+				modTime = metaModTime
+			}
+		default:
+			// Do nothing for now
+		}
+	}
+	return modTime, nil
 }
 
 // OpenChunkWriter returns the chunk size and a ChunkWriter
@@ -2097,20 +2368,27 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		return info, nil, err
 	}
 
+	up, err := f.newLargeUpload(ctx, o, nil, src, f.opt.ChunkSize, false, nil, options...)
+	if err != nil {
+		return info, nil, err
+	}
+
 	info = fs.ChunkWriterInfo{
-		ChunkSize:   int64(f.opt.ChunkSize),
+		ChunkSize:   up.chunkSize,
 		Concurrency: o.fs.opt.UploadConcurrency,
 		//LeavePartsOnError: o.fs.opt.LeavePartsOnError,
 	}
-	up, err := f.newLargeUpload(ctx, o, nil, src, f.opt.ChunkSize, false, nil)
-	return info, up, err
+	return info, up, nil
 }
 
 // Remove an object
 func (o *Object) Remove(ctx context.Context) error {
 	bucket, bucketPath := o.split()
 	if o.fs.opt.Versions {
-		return errNotWithVersions
+		t, path := api.RemoveVersion(bucketPath)
+		if !t.IsZero() {
+			return o.fs.deleteByID(ctx, o.id, path)
+		}
 	}
 	if o.fs.opt.VersionAt.IsSet() {
 		return errNotWithVersionAt
@@ -2133,31 +2411,36 @@ func (o *Object) ID() string {
 
 var lifecycleHelp = fs.CommandHelp{
 	Name:  "lifecycle",
-	Short: "Read or set the lifecycle for a bucket",
+	Short: "Read or set the lifecycle for a bucket.",
 	Long: `This command can be used to read or set the lifecycle for a bucket.
-
-Usage Examples:
 
 To show the current lifecycle rules:
 
-    rclone backend lifecycle b2:bucket
+` + "```console" + `
+rclone backend lifecycle b2:bucket
+` + "```" + `
 
 This will dump something like this showing the lifecycle rules.
 
-    [
-        {
-            "daysFromHidingToDeleting": 1,
-            "daysFromUploadingToHiding": null,
-            "fileNamePrefix": ""
-        }
-    ]
+` + "```json" + `
+[
+    {
+        "daysFromHidingToDeleting": 1,
+        "daysFromUploadingToHiding": null,
+        "daysFromStartingToCancelingUnfinishedLargeFiles": null,
+        "fileNamePrefix": ""
+    }
+]
+` + "```" + `
 
-If there are no lifecycle rules (the default) then it will just return [].
+If there are no lifecycle rules (the default) then it will just return ` + "`[]`" + `.
 
 To reset the current lifecycle rules:
 
-    rclone backend lifecycle b2:bucket -o daysFromHidingToDeleting=30
-    rclone backend lifecycle b2:bucket -o daysFromUploadingToHiding=5 -o daysFromHidingToDeleting=1
+` + "```console" + `
+rclone backend lifecycle b2:bucket -o daysFromHidingToDeleting=30
+rclone backend lifecycle b2:bucket -o daysFromUploadingToHiding=5 -o daysFromHidingToDeleting=1
+` + "```" + `
 
 This will run and then print the new lifecycle rules as above.
 
@@ -2169,17 +2452,21 @@ the daysFromHidingToDeleting to 1 day. You can enable hard_delete in
 the config also which will mean deletions won't cause versions but
 overwrites will still cause versions to be made.
 
-    rclone backend lifecycle b2:bucket -o daysFromHidingToDeleting=1
+` + "```console" + `
+rclone backend lifecycle b2:bucket -o daysFromHidingToDeleting=1
+` + "```" + `
 
-See: https://www.backblaze.com/docs/cloud-storage-lifecycle-rules
-`,
+See: <https://www.backblaze.com/docs/cloud-storage-lifecycle-rules>`,
 	Opts: map[string]string{
-		"daysFromHidingToDeleting":  "After a file has been hidden for this many days it is deleted. 0 is off.",
-		"daysFromUploadingToHiding": "This many days after uploading a file is hidden",
+		"daysFromHidingToDeleting": `After a file has been hidden for this many days
+it is deleted. 0 is off.`,
+		"daysFromUploadingToHiding": `This many days after uploading a file is hidden.`,
+		"daysFromStartingToCancelingUnfinishedLargeFiles": `Cancels any unfinished
+large file versions after this many days.`,
 	},
 }
 
-func (f *Fs) lifecycleCommand(ctx context.Context, name string, arg []string, opt map[string]string) (out interface{}, err error) {
+func (f *Fs) lifecycleCommand(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
 	var newRule api.LifecycleRule
 	if daysStr := opt["daysFromHidingToDeleting"]; daysStr != "" {
 		days, err := strconv.Atoi(daysStr)
@@ -2195,14 +2482,23 @@ func (f *Fs) lifecycleCommand(ctx context.Context, name string, arg []string, op
 		}
 		newRule.DaysFromUploadingToHiding = &days
 	}
+	if daysStr := opt["daysFromStartingToCancelingUnfinishedLargeFiles"]; daysStr != "" {
+		days, err := strconv.Atoi(daysStr)
+		if err != nil {
+			return nil, fmt.Errorf("bad daysFromStartingToCancelingUnfinishedLargeFiles: %w", err)
+		}
+		newRule.DaysFromStartingToCancelingUnfinishedLargeFiles = &days
+	}
 	bucketName, _ := f.split("")
 	if bucketName == "" {
 		return nil, errors.New("bucket required")
 
 	}
 
+	skip := operations.SkipDestructive(ctx, name, "update lifecycle rules")
+
 	var bucket *api.Bucket
-	if newRule.DaysFromHidingToDeleting != nil || newRule.DaysFromUploadingToHiding != nil {
+	if !skip && (newRule.DaysFromHidingToDeleting != nil || newRule.DaysFromUploadingToHiding != nil || newRule.DaysFromStartingToCancelingUnfinishedLargeFiles != nil) {
 		bucketID, err := f.getBucketID(ctx, bucketName)
 		if err != nil {
 			return nil, err
@@ -2240,8 +2536,58 @@ func (f *Fs) lifecycleCommand(ctx context.Context, name string, arg []string, op
 	return bucket.LifecycleRules, nil
 }
 
+var cleanupHelp = fs.CommandHelp{
+	Name:  "cleanup",
+	Short: "Remove unfinished large file uploads.",
+	Long: `This command removes unfinished large file uploads of age greater than
+max-age, which defaults to 24 hours.
+
+Note that you can use --interactive/-i or --dry-run with this command to see what
+it would do.
+
+` + "```console" + `
+rclone backend cleanup b2:bucket/path/to/object
+rclone backend cleanup -o max-age=7w b2:bucket/path/to/object
+` + "```" + `
+
+Durations are parsed as per the rest of rclone, 2h, 7d, 7w etc.`,
+	Opts: map[string]string{
+		"max-age": "Max age of upload to delete.",
+	},
+}
+
+func (f *Fs) cleanupCommand(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
+	maxAge := defaultMaxAge
+	if opt["max-age"] != "" {
+		maxAge, err = fs.ParseDuration(opt["max-age"])
+		if err != nil {
+			return nil, fmt.Errorf("bad max-age: %w", err)
+		}
+	}
+	return nil, f.cleanUp(ctx, false, true, maxAge)
+}
+
+var cleanupHiddenHelp = fs.CommandHelp{
+	Name:  "cleanup-hidden",
+	Short: "Remove old versions of files.",
+	Long: `This command removes any old hidden versions of files.
+
+Note that you can use --interactive/-i or --dry-run with this command to see what
+it would do.
+
+` + "```console" + `
+rclone backend cleanup-hidden b2:bucket/path/to/dir
+` + "```",
+}
+
+func (f *Fs) cleanupHiddenCommand(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
+	return nil, f.cleanUp(ctx, true, false, 0)
+}
+
 var commandHelp = []fs.CommandHelp{
 	lifecycleHelp,
+	cleanupHelp,
+	cleanupHiddenHelp,
 }
 
 // Command the backend to run a named command
@@ -2253,10 +2599,14 @@ var commandHelp = []fs.CommandHelp{
 // The result should be capable of being JSON encoded
 // If it is a string or a []string it will be shown to the user
 // otherwise it will be JSON encoded and shown to the user like that
-func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out interface{}, err error) {
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
 	switch name {
 	case "lifecycle":
 		return f.lifecycleCommand(ctx, name, arg, opt)
+	case "cleanup":
+		return f.cleanupCommand(ctx, name, arg, opt)
+	case "cleanup-hidden":
+		return f.cleanupHiddenCommand(ctx, name, arg, opt)
 	default:
 		return nil, fs.ErrorCommandNotFound
 	}
@@ -2270,6 +2620,7 @@ var (
 	_ fs.PutStreamer     = &Fs{}
 	_ fs.CleanUpper      = &Fs{}
 	_ fs.ListRer         = &Fs{}
+	_ fs.ListPer         = &Fs{}
 	_ fs.PublicLinker    = &Fs{}
 	_ fs.OpenChunkWriter = &Fs{}
 	_ fs.Commander       = &Fs{}

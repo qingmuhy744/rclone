@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/multipart"
+	"github.com/rclone/rclone/lib/pool"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -72,11 +74,15 @@ func (mc *multiThreadCopyState) copyChunk(ctx context.Context, chunk int, writer
 	if start >= mc.size {
 		return nil
 	}
-	end := start + mc.partSize
-	if end > mc.size {
-		end = mc.size
-	}
+	end := min(start+mc.partSize, mc.size)
 	size := end - start
+
+	// Reserve the memory first so we don't open the source and wait for memory buffers for ages
+	var rw *pool.RW
+	if !mc.noBuffering {
+		rw = multipart.NewRW().Reserve(size)
+		defer fs.CheckClose(rw, &err)
+	}
 
 	fs.Debugf(mc.src, "multi-thread copy: chunk %d/%d (%d-%d) size %v starting", chunk+1, mc.numChunks, start, end, fs.SizeSuffix(size))
 
@@ -94,8 +100,6 @@ func (mc *multiThreadCopyState) copyChunk(ctx context.Context, chunk int, writer
 		rs = rc
 	} else {
 		// Read the chunk into buffered reader
-		rw := multipart.NewRW()
-		defer fs.CheckClose(rw, &err)
 		_, err = io.CopyN(rw, rc, size)
 		if err != nil {
 			return fmt.Errorf("multi-thread copy: failed to read chunk: %w", err)
@@ -131,6 +135,7 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 	openChunkWriter := f.Features().OpenChunkWriter
 	ci := fs.GetConfig(ctx)
 	noBuffering := false
+	usingOpenWriterAt := false
 	if openChunkWriter == nil {
 		openWriterAt := f.Features().OpenWriterAt
 		if openWriterAt == nil {
@@ -140,6 +145,7 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 		// If we are using OpenWriterAt we don't seek the chunks so don't need to buffer
 		fs.Debugf(src, "multi-thread copy: disabling buffering because destination uses OpenWriterAt")
 		noBuffering = true
+		usingOpenWriterAt = true
 	} else if src.Fs().Features().IsLocal {
 		// If the source fs is local we don't need to buffer
 		fs.Debugf(src, "multi-thread copy: disabling buffering because source is local disk")
@@ -215,7 +221,7 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 	mc.acc = tr.Account(gCtx, nil)
 
 	fs.Debugf(src, "Starting multi-thread copy with %d chunks of size %v with %v parallel streams", mc.numChunks, fs.SizeSuffix(mc.partSize), concurrency)
-	for chunk := 0; chunk < mc.numChunks; chunk++ {
+	for chunk := range mc.numChunks {
 		// Fail fast, in case an errgroup managed function returns an error
 		if gCtx.Err() != nil {
 			break
@@ -241,38 +247,40 @@ func multiThreadCopy(ctx context.Context, f fs.Fs, remote string, src fs.Object,
 		return nil, fmt.Errorf("multi-thread copy: failed to find object after copy: %w", err)
 	}
 
-	if f.Features().PartialUploads {
-		err = obj.SetModTime(ctx, src.ModTime(ctx))
-		switch err {
-		case nil, fs.ErrorCantSetModTime, fs.ErrorCantSetModTimeWithoutDelete:
-		default:
-			return nil, fmt.Errorf("multi-thread copy: failed to set modification time: %w", err)
+	// OpenWriterAt doesn't set metadata so we need to set it on completion
+	if usingOpenWriterAt {
+		setModTime := true
+		if ci.Metadata {
+			do, ok := obj.(fs.SetMetadataer)
+			if ok {
+				meta, err := fs.GetMetadataOptions(ctx, f, src, options)
+				if err != nil {
+					return nil, fmt.Errorf("multi-thread copy: failed to read metadata from source object: %w", err)
+				}
+				if _, foundMeta := meta["mtime"]; !foundMeta {
+					meta.Set("mtime", src.ModTime(ctx).Format(time.RFC3339Nano))
+				}
+				err = do.SetMetadata(ctx, meta)
+				if err != nil {
+					return nil, fmt.Errorf("multi-thread copy: failed to set metadata: %w", err)
+				}
+				setModTime = false
+			} else {
+				fs.Errorf(obj, "multi-thread copy: can't set metadata as SetMetadata isn't implemented in: %v", f)
+			}
+		}
+		if setModTime {
+			err = obj.SetModTime(ctx, src.ModTime(ctx))
+			switch err {
+			case nil, fs.ErrorCantSetModTime, fs.ErrorCantSetModTimeWithoutDelete:
+			default:
+				return nil, fmt.Errorf("multi-thread copy: failed to set modification time: %w", err)
+			}
 		}
 	}
 
 	fs.Debugf(src, "Finished multi-thread copy with %d parts of size %v", mc.numChunks, fs.SizeSuffix(mc.partSize))
 	return obj, nil
-}
-
-// An offsetWriter maps writes at offset base to offset base+off in the underlying writer.
-//
-// Modified from the go source code. Can be replaced with
-// io.OffsetWriter when we no longer need to support go1.19
-type offsetWriter struct {
-	w   io.WriterAt
-	off int64 // the current offset
-}
-
-// newOffsetWriter returns an offsetWriter that writes to w
-// starting at offset off.
-func newOffsetWriter(w io.WriterAt, off int64) *offsetWriter {
-	return &offsetWriter{w, off}
-}
-
-func (o *offsetWriter) Write(p []byte) (n int, err error) {
-	n, err = o.w.WriteAt(p, o.off)
-	o.off += int64(n)
-	return
 }
 
 // writerAtChunkWriter converts a WriterAtCloser into a ChunkWriter
@@ -296,7 +304,7 @@ func (w *writerAtChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, r
 		bytesToWrite = w.size % w.chunkSize
 	}
 
-	var writer io.Writer = newOffsetWriter(w.writerAt, int64(chunkNumber)*w.chunkSize)
+	var writer io.Writer = io.NewOffsetWriter(w.writerAt, int64(chunkNumber)*w.chunkSize)
 	if w.writeBufferSize > 0 {
 		writer = bufio.NewWriterSize(writer, int(w.writeBufferSize))
 	}
@@ -310,8 +318,8 @@ func (w *writerAtChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, r
 	// if we were buffering, flush to disk
 	switch w := writer.(type) {
 	case *bufio.Writer:
-		er2 := w.Flush()
-		if er2 != nil {
+		err = w.Flush()
+		if err != nil {
 			return -1, fmt.Errorf("multi-thread copy: flush failed: %w", err)
 		}
 	}

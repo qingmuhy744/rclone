@@ -111,7 +111,8 @@ func init() {
 				encoder.EncodeSlash |
 				encoder.EncodeBackSlash |
 				encoder.EncodeDoubleQuote |
-				encoder.EncodeInvalidUtf8),
+				encoder.EncodeInvalidUtf8 |
+				encoder.EncodeDot),
 		}},
 	})
 }
@@ -300,6 +301,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 				return f, nil
 			}
 			return f, err
+		}
+		// Correct root if definitely pointing to a file
+		f.root = path.Dir(f.root)
+		if f.root == "." || f.root == "/" {
+			f.root = ""
 		}
 		// return an error with an fs which points to the parent
 		return f, fs.ErrorIsFile
@@ -1308,7 +1314,7 @@ func (f *Fs) getCachedLibraries(ctx context.Context) ([]api.Library, error) {
 	f.librariesMutex.Lock()
 	defer f.librariesMutex.Unlock()
 
-	libraries, err := f.libraries.Get(librariesCacheKey, func(key string) (value interface{}, ok bool, error error) {
+	libraries, err := f.libraries.Get(librariesCacheKey, func(key string) (value any, ok bool, error error) {
 		// Load the libraries if not present in the cache
 		libraries, err := f.getLibraries(ctx)
 		if err != nil {

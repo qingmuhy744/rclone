@@ -358,13 +358,8 @@ func (dc *DirCache) RootParentID(ctx context.Context, create bool) (ID string, e
 			return "", err
 		}
 		dc.rootParentID = rootParentID
-	} else {
-		if dc.rootID == dc.trueRootID {
-			return "", errors.New("is root directory")
-		}
-	}
-	if dc.rootParentID == "" {
-		return "", errors.New("internal error: didn't find rootParentID")
+	} else if dc.rootID == dc.trueRootID {
+		return "", errors.New("is root directory")
 	}
 	return dc.rootParentID, nil
 }

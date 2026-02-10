@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path"
 	"regexp"
@@ -27,19 +26,21 @@ import (
 	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/spf13/cobra"
 )
 
 var (
 	writeJSON          string
+	keepTestFiles      bool
 	checkNormalization bool
 	checkControl       bool
 	checkLength        bool
 	checkStreaming     bool
 	checkBase32768     bool
 	all                bool
-	uploadWait         time.Duration
+	uploadWait         fs.Duration
 	positionLeftRe     = regexp.MustCompile(`(?s)^(.*)-position-left-([[:xdigit:]]+)$`)
 	positionMiddleRe   = regexp.MustCompile(`(?s)^position-middle-([[:xdigit:]]+)-(.*)-$`)
 	positionRightRe    = regexp.MustCompile(`(?s)^position-right-([[:xdigit:]]+)-(.*)$`)
@@ -51,30 +52,30 @@ func init() {
 	flags.StringVarP(cmdFlags, &writeJSON, "write-json", "", "", "Write results to file", "")
 	flags.BoolVarP(cmdFlags, &checkNormalization, "check-normalization", "", false, "Check UTF-8 Normalization", "")
 	flags.BoolVarP(cmdFlags, &checkControl, "check-control", "", false, "Check control characters", "")
-	flags.DurationVarP(cmdFlags, &uploadWait, "upload-wait", "", 0, "Wait after writing a file", "")
+	flags.FVarP(cmdFlags, &uploadWait, "upload-wait", "", "Wait after writing a file", "")
 	flags.BoolVarP(cmdFlags, &checkLength, "check-length", "", false, "Check max filename length", "")
 	flags.BoolVarP(cmdFlags, &checkStreaming, "check-streaming", "", false, "Check uploads with indeterminate file size", "")
 	flags.BoolVarP(cmdFlags, &checkBase32768, "check-base32768", "", false, "Check can store all possible base32768 characters", "")
 	flags.BoolVarP(cmdFlags, &all, "all", "", false, "Run all tests", "")
+	flags.BoolVarP(cmdFlags, &keepTestFiles, "keep-test-files", "", false, "Keep test files after execution", "")
 }
 
 var commandDefinition = &cobra.Command{
 	Use:   "info [remote:path]+",
 	Short: `Discovers file name or other limitations for paths.`,
-	Long: `rclone info discovers what filenames and upload methods are possible
-to write to the paths passed in and how long they can be.  It can take some
-time.  It will write test files into the remote:path passed in.  It outputs
-a bit of go code for each one.
+	Long: `Discovers what filenames and upload methods are possible to write to the
+paths passed in and how long they can be.  It can take some time.  It will
+write test files into the remote:path passed in.  It outputs a bit of go
+code for each one.
 
-**NB** this can create undeletable files and other hazards - use with care
-`,
+**NB** this can create undeletable files and other hazards - use with care!`,
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.55",
 	},
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(1, 1e6, command, args)
 		if !checkNormalization && !checkControl && !checkLength && !checkStreaming && !checkBase32768 && !all {
-			log.Fatalf("no tests selected - select a test or use --all")
+			fs.Fatalf(nil, "no tests selected - select a test or use --all")
 		}
 		if all {
 			checkNormalization = true
@@ -84,7 +85,15 @@ a bit of go code for each one.
 			checkBase32768 = true
 		}
 		for i := range args {
-			f := cmd.NewFsDir(args[i : i+1])
+			tempDirName := "rclone-test-info-" + random.String(8)
+			tempDirPath := path.Join(args[i], tempDirName)
+			f := cmd.NewFsDir([]string{tempDirPath})
+			fs.Infof(f, "Created temporary directory for test files: %s", tempDirPath)
+			err := f.Mkdir(context.Background(), "")
+			if err != nil {
+				fs.Fatalf(nil, "couldn't create temporary directory: %v", err)
+			}
+
 			cmd.Run(false, false, command, func() error {
 				return readInfo(context.Background(), f)
 			})
@@ -194,7 +203,7 @@ func (r *results) writeFile(path string) (fs.Object, error) {
 	src := object.NewStaticObjectInfo(path, time.Now(), int64(len(contents)), true, nil, r.f)
 	obj, err := r.f.Put(r.ctx, bytes.NewBufferString(contents), src)
 	if uploadWait > 0 {
-		time.Sleep(uploadWait)
+		time.Sleep(time.Duration(uploadWait))
 	}
 	return obj, err
 }
@@ -224,7 +233,6 @@ func (r *results) checkStringPositions(k, s string) {
 	fs.Infof(r.f, "Writing position file 0x%0X", s)
 	positionError := internal.PositionNone
 	res := internal.ControlResult{
-		Text:       s,
 		WriteError: make(map[internal.Position]string, 3),
 		GetError:   make(map[internal.Position]string, 3),
 		InList:     make(map[internal.Position]internal.Presence, 3),
@@ -279,11 +287,11 @@ func (r *results) checkControls() {
 
 	// Concurrency control
 	tokens := make(chan struct{}, ci.Checkers)
-	for i := 0; i < ci.Checkers; i++ {
+	for range ci.Checkers {
 		tokens <- struct{}{}
 	}
 	var wg sync.WaitGroup
-	for i := rune(0); i < 128; i++ {
+	for i := range rune(128) {
 		s := string(i)
 		if i == 0 || i == '/' {
 			// We're not even going to check NULL or /
@@ -471,10 +479,18 @@ func (r *results) checkStreaming() {
 }
 
 func readInfo(ctx context.Context, f fs.Fs) error {
-	err := f.Mkdir(ctx, "")
-	if err != nil {
-		return fmt.Errorf("couldn't mkdir: %w", err)
+	// Ensure cleanup unless --keep-test-files is specified
+	if !keepTestFiles {
+		defer func() {
+			err := operations.Purge(ctx, f, "")
+			if err != nil {
+				fs.Errorf(f, "Failed to purge temporary directory: %v", err)
+			} else {
+				fs.Infof(f, "Removed temporary directory for test files: %s", f.Root())
+			}
+		}()
 	}
+
 	r := newResults(ctx, f)
 	if checkControl {
 		r.checkControls()

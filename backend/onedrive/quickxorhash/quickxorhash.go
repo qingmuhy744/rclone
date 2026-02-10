@@ -26,7 +26,10 @@ package quickxorhash
 // OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
 // PERFORMANCE OF THIS SOFTWARE.
 
-import "hash"
+import (
+	"crypto/subtle"
+	"hash"
+)
 
 const (
 	// BlockSize is the preferred size for hashing
@@ -46,6 +49,11 @@ type quickXorHash struct {
 // New returns a new hash.Hash computing the quickXorHash checksum.
 func New() hash.Hash {
 	return &quickXorHash{}
+}
+
+// xor dst with src
+func xorBytes(dst, src []byte) int {
+	return subtle.XORBytes(dst, src, dst)
 }
 
 // Write (via the embedded io.Writer interface) adds more data to the running hash.
@@ -78,7 +86,7 @@ func (q *quickXorHash) Write(p []byte) (n int, err error) {
 
 // Calculate the current checksum
 func (q *quickXorHash) checkSum() (h [Size + 1]byte) {
-	for i := 0; i < dataSize; i++ {
+	for i := range dataSize {
 		shift := (i * 11) % 160
 		shiftBytes := shift / 8
 		shiftBits := shift % 8

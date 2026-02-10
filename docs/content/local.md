@@ -8,7 +8,9 @@ versionIntroduced: "v0.91"
 
 Local paths are specified as normal filesystem paths, e.g. `/path/to/wherever`, so
 
-    rclone sync --interactive /home/source /tmp/destination
+```console
+rclone sync --interactive /home/source /tmp/destination
+```
 
 Will sync `/home/source` to `/tmp/destination`.
 
@@ -25,7 +27,7 @@ Rclone reads and writes the modification times using an accuracy determined
 by the OS. Typically this is 1ns on Linux, 10 ns on Windows and 1 Second
 on OS X.
 
-### Filenames ###
+### Filenames
 
 Filenames should be encoded in UTF-8 on disk. This is the normal case
 for Windows and OS X.
@@ -41,7 +43,7 @@ be replaced with a quoted representation of the invalid bytes. The name
 `gro\xdf` will be transferred as `gro‛DF`. `rclone` will emit a debug
 message in this case (use `-v` to see), e.g.
 
-```
+```text
 Local file system at .: Replacing invalid UTF-8 characters in "gro\xdf"
 ```
 
@@ -117,7 +119,7 @@ These only get replaced if they are the last character in the name:
 Invalid UTF-8 bytes will also be [replaced](/overview/#invalid-utf8),
 as they can't be converted to UTF-16.
 
-### Paths on Windows ###
+### Paths on Windows
 
 On Windows there are many ways of specifying a path to a file system resource.
 Local paths can be absolute, like `C:\path\to\wherever`, or relative,
@@ -130,17 +132,14 @@ This format requires absolute paths and the use of prefix `\\?\`,
 e.g. `\\?\D:\some\very\long\path`. For convenience rclone will automatically
 convert regular paths into the corresponding extended-length paths,
 so in most cases you do not have to worry about this (read more [below](#long-paths)).
+Using the same prefix `\\?\` it is also possible to specify path to volumes
+identified by their GUID, e.g. `\\?\Volume{b75e2c83-0000-0000-0000-602f00000000}\some\path`.
 
-Note that Windows supports using the same prefix `\\?\` to
-specify path to volumes identified by their GUID, e.g.
-`\\?\Volume{b75e2c83-0000-0000-0000-602f00000000}\some\path`.
-This is *not* supported in rclone, due to an [issue](https://github.com/golang/go/issues/39785)
-in go.
-
-#### Long paths ####
+#### Long paths
 
 Rclone handles long paths automatically, by converting all paths to
-[extended-length path format](https://docs.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation), which allows paths up to 32,767 characters.
+[extended-length path format](https://docs.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation),
+which allows paths up to 32,767 characters.
 
 This conversion will ensure paths are absolute and prefix them with
 the `\\?\`. This is why you will see that your paths, for instance
@@ -151,18 +150,19 @@ However, in rare cases this may cause problems with buggy file
 system drivers like [EncFS](https://github.com/rclone/rclone/issues/261).
 To disable UNC conversion globally, add this to your `.rclone.conf` file:
 
-```
+```ini
 [local]
 nounc = true
 ```
 
 If you want to selectively disable UNC, you can add it to a separate entry like this:
 
-```
+```ini
 [nounc]
 type = local
 nounc = true
 ```
+
 And use rclone like this:
 
 `rclone copy c:\src nounc:z:\dst`
@@ -184,7 +184,7 @@ This flag applies to all commands.
 
 For example, supposing you have a directory structure like this
 
-```
+```console
 $ tree /tmp/a
 /tmp/a
 ├── b -> ../b
@@ -196,7 +196,7 @@ $ tree /tmp/a
 
 Then you can see the difference with and without the flag like this
 
-```
+```console
 $ rclone ls /tmp/a
         6 one
         6 two/three
@@ -204,7 +204,7 @@ $ rclone ls /tmp/a
 
 and
 
-```
+```console
 $ rclone -L ls /tmp/a
      4174 expected
         6 one
@@ -213,13 +213,13 @@ $ rclone -L ls /tmp/a
         6 b/one
 ```
 
-#### --links, -l 
+#### --local-links, --links, -l
 
 Normally rclone will ignore symlinks or junction points (which behave
 like symlinks under Windows).
 
 If you supply this flag then rclone will copy symbolic links from the local storage,
-and store them as text files, with a '.rclonelink' suffix in the remote storage.
+and store them as text files, with a `.rclonelink` suffix in the remote storage.
 
 The text file will contain the target of the symbolic link (see example).
 
@@ -227,7 +227,7 @@ This flag applies to all commands.
 
 For example, supposing you have a directory structure like this
 
-```
+```console
 $ tree /tmp/a
 /tmp/a
 ├── file1 -> ./file4
@@ -236,13 +236,13 @@ $ tree /tmp/a
 
 Copying the entire directory with '-l'
 
-```
-$ rclone copyto -l /tmp/a/file1 remote:/tmp/a/
+```console
+rclone copy -l /tmp/a/ remote:/tmp/a/
 ```
 
-The remote files are created with a '.rclonelink' suffix
+The remote files are created with a `.rclonelink` suffix
 
-```
+```console
 $ rclone ls remote:/tmp/a
        5 file1.rclonelink
       14 file2.rclonelink
@@ -250,7 +250,7 @@ $ rclone ls remote:/tmp/a
 
 The remote files will contain the target of the symbolic links
 
-```
+```console
 $ rclone cat remote:/tmp/a/file1.rclonelink
 ./file4
 
@@ -260,8 +260,8 @@ $ rclone cat remote:/tmp/a/file2.rclonelink
 
 Copying them back with '-l'
 
-```
-$ rclone copyto -l remote:/tmp/a/ /tmp/b/
+```console
+$ rclone copy -l remote:/tmp/a/ /tmp/b/
 
 $ tree /tmp/b
 /tmp/b
@@ -271,14 +271,28 @@ $ tree /tmp/b
 
 However, if copied back without '-l'
 
-```
+```console
 $ rclone copyto remote:/tmp/a/ /tmp/b/
 
 $ tree /tmp/b
 /tmp/b
 ├── file1.rclonelink
 └── file2.rclonelink
-````
+```
+
+If you want to copy a single file with `-l` then you must use the `.rclonelink` suffix.
+
+```console
+$ rclone copy -l remote:/tmp/a/file1.rclonelink /tmp/c
+
+$ tree /tmp/c
+/tmp/c
+└── file1 -> ./file4
+```
+
+Note that `--local-links` just enables this feature for the local
+backend. `--links` and `-l` enable the feature for all supported
+backends and the VFS.
 
 Note that this flag is incompatible with `-copy-links` / `-L`.
 
@@ -292,7 +306,7 @@ different file systems.
 
 For example if you have a directory hierarchy like this
 
-```
+```console
 root
 ├── disk1     - disk1 mounted on the root
 │   └── file3 - stored on disk1
@@ -302,15 +316,16 @@ root
 └── file2     - stored on the root disk
 ```
 
-Using `rclone --one-file-system copy root remote:` will only copy `file1` and `file2`.  Eg
+Using `rclone --one-file-system copy root remote:` will only copy `file1`
+and `file2`. E.g.
 
-```
+```console
 $ rclone -q --one-file-system ls root
         0 file1
         0 file2
 ```
 
-```
+```console
 $ rclone -q ls root
         0 disk1/file3
         0 disk2/file4
@@ -325,7 +340,7 @@ filesystem.
 **NB** This flag is only available on Unix based systems.  On systems
 where it isn't supported (e.g. Windows) it will be ignored.
 
-{{< rem autogenerated options start" - DO NOT EDIT - instead edit fs.RegInfo in backend/local/local.go then run make backenddocs" >}}
+<!-- autogenerated options start - DO NOT EDIT - instead edit fs.RegInfo in backend/local/local.go and run make backenddocs to verify --> <!-- markdownlint-disable-line line-length -->
 ### Advanced options
 
 Here are the Advanced options specific to local (Local Disk).
@@ -341,8 +356,8 @@ Properties:
 - Type:        bool
 - Default:     false
 - Examples:
-    - "true"
-        - Disables long file names.
+  - "true"
+    - Disables long file names.
 
 #### --copy-links / -L
 
@@ -355,9 +370,9 @@ Properties:
 - Type:        bool
 - Default:     false
 
-#### --links / -l
+#### --local-links
 
-Translate symlinks to/from regular files with a '.rclonelink' extension.
+Translate symlinks to/from regular files with a '.rclonelink' extension for the local backend.
 
 Properties:
 
@@ -377,6 +392,21 @@ Properties:
 
 - Config:      skip_links
 - Env Var:     RCLONE_LOCAL_SKIP_LINKS
+- Type:        bool
+- Default:     false
+
+#### --skip-specials
+
+Don't warn about skipped pipes, sockets and device objects.
+
+This flag disables warning messages on skipped pipes, sockets and
+device objects, as you explicitly acknowledge that they should be
+skipped.
+
+Properties:
+
+- Config:      skip_specials
+- Env Var:     RCLONE_LOCAL_SKIP_SPECIALS
 - Type:        bool
 - Default:     false
 
@@ -506,6 +536,32 @@ Properties:
 - Type:        bool
 - Default:     false
 
+#### --local-no-clone
+
+Disable reflink cloning for server-side copies.
+
+Normally, for local-to-local transfers, rclone will "clone" the file when
+possible, and fall back to "copying" only when cloning is not supported.
+
+Cloning creates a shallow copy (or "reflink") which initially shares blocks with
+the original file. Unlike a "hardlink", the two files are independent and
+neither will affect the other if subsequently modified.
+
+Cloning is usually preferable to copying, as it is much faster and is
+deduplicated by default (i.e. having two identical files does not consume more
+storage than having just one.)  However, for use cases where data redundancy is
+preferable, --local-no-clone can be used to disable cloning and force "deep" copies.
+
+Currently, cloning is only supported when using APFS on macOS (support for other
+platforms may be added in the future.)
+
+Properties:
+
+- Config:      no_clone
+- Env Var:     RCLONE_LOCAL_NO_CLONE
+- Type:        bool
+- Default:     false
+
 #### --local-no-preallocate
 
 Disable preallocation of disk space for transferred files.
@@ -556,6 +612,55 @@ Properties:
 - Type:        bool
 - Default:     false
 
+#### --local-time-type
+
+Set what kind of time is returned.
+
+Normally rclone does all operations on the mtime or Modification time.
+
+If you set this flag then rclone will return the Modified time as whatever
+you set here. So if you use "rclone lsl --local-time-type ctime" then
+you will see ctimes in the listing.
+
+If the OS doesn't support returning the time_type specified then rclone
+will silently replace it with the modification time which all OSes support.
+
+- mtime is supported by all OSes
+- atime is supported on all OSes except: plan9, js
+- btime is only supported on: Windows, macOS, freebsd, netbsd
+- ctime is supported on all Oses except: Windows, plan9, js
+
+Note that setting the time will still set the modified time so this is
+only useful for reading.
+
+
+Properties:
+
+- Config:      time_type
+- Env Var:     RCLONE_LOCAL_TIME_TYPE
+- Type:        mtime|atime|btime|ctime
+- Default:     mtime
+- Examples:
+  - "mtime"
+    - The last modification time.
+  - "atime"
+    - The last access time.
+  - "btime"
+    - The creation time.
+  - "ctime"
+    - The last status change time.
+
+#### --local-hashes
+
+Comma separated list of supported checksum types.
+
+Properties:
+
+- Config:      hashes
+- Env Var:     RCLONE_LOCAL_HASHES
+- Type:        CommaSepList
+- Default:     
+
 #### --local-encoding
 
 The encoding for the backend.
@@ -569,6 +674,17 @@ Properties:
 - Type:        Encoding
 - Default:     Slash,Dot
 
+#### --local-description
+
+Description of the remote.
+
+Properties:
+
+- Config:      description
+- Env Var:     RCLONE_LOCAL_DESCRIPTION
+- Type:        string
+- Required:    false
+
 ### Metadata
 
 Depending on which OS is in use the local backend may return only some
@@ -579,6 +695,8 @@ netbsd, macOS and Solaris. It is **not** supported on Windows yet
 
 User metadata is stored as extended attributes (which may not be
 supported by all file systems) under the "user.*" prefix.
+
+Metadata is supported on files and directories.
 
 Here are the possible system metadata items for the local backend.
 
@@ -598,9 +716,11 @@ See the [metadata](/docs/#metadata) docs for more info.
 
 Here are the commands specific to the local backend.
 
-Run them with
+Run them with:
 
-    rclone backend COMMAND remote:
+```console
+rclone backend COMMAND remote:
+```
 
 The help below will explain what arguments each command takes.
 
@@ -612,16 +732,17 @@ These can be run on a running backend using the rc command
 
 ### noop
 
-A null operation for testing backend commands
+A null operation for testing backend commands.
 
-    rclone backend noop remote: [options] [<arguments>+]
+```console
+rclone backend noop remote: [options] [<arguments>+]
+```
 
-This is a test command which has some options
-you can try to change the output.
+This is a test command which has some options you can try to change the output.
 
 Options:
 
-- "echo": echo the input arguments
-- "error": return an error based on option value
+- "echo": Echo the input arguments.
+- "error": Return an error based on option value.
 
-{{< rem autogenerated options stop >}}
+<!-- autogenerated options stop -->

@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/rclone/rclone/backend/all" // import all the backends
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/vfs/vfscommon"
@@ -28,8 +27,8 @@ var (
 
 // Constants uses in the tests
 const (
-	writeBackDelay      = 100 * time.Millisecond // A short writeback delay for testing
-	waitForWritersDelay = 30 * time.Second       // time to wait for existing writers
+	writeBackDelay      = fs.Duration(100 * time.Millisecond) // A short writeback delay for testing
+	waitForWritersDelay = 30 * time.Second                    // time to wait for existing writers
 )
 
 // TestMain drives the tests
@@ -125,7 +124,7 @@ func TestVFSbaseHandle(t *testing.T) {
 	assert.Nil(t, node)
 }
 
-// TestNew sees if the New command works properly
+// TestVFSNew sees if the New command works properly
 func TestVFSNew(t *testing.T) {
 	// Check active cache has this many entries
 	checkActiveCacheEntries := func(i int) {
@@ -138,10 +137,8 @@ func TestVFSNew(t *testing.T) {
 	r, vfs := newTestVFS(t)
 
 	// Check making a VFS with nil options
-	var defaultOpt = vfscommon.DefaultOpt
-	defaultOpt.DirPerms |= os.ModeDir
-	assert.Equal(t, vfs.Opt, defaultOpt)
-	assert.Equal(t, vfs.f, r.Fremote)
+	var defaultOpt = vfscommon.Opt
+	defaultOpt.Init()
 
 	checkActiveCacheEntries(1)
 
@@ -162,19 +159,19 @@ func TestVFSNew(t *testing.T) {
 	checkActiveCacheEntries(0)
 }
 
-// TestNew sees if the New command works properly
+// TestVFSNewWithOpts sees if the New command works properly
 func TestVFSNewWithOpts(t *testing.T) {
-	var opt = vfscommon.DefaultOpt
+	var opt = vfscommon.Opt
 	opt.DirPerms = 0777
 	opt.FilePerms = 0666
 	opt.Umask = 0002
 	_, vfs := newTestVFSOpt(t, &opt)
 
-	assert.Equal(t, os.FileMode(0775)|os.ModeDir, vfs.Opt.DirPerms)
-	assert.Equal(t, os.FileMode(0664), vfs.Opt.FilePerms)
+	assert.Equal(t, vfscommon.FileMode(0775)|vfscommon.FileMode(os.ModeDir), vfs.Opt.DirPerms)
+	assert.Equal(t, vfscommon.FileMode(0664), vfs.Opt.FilePerms)
 }
 
-// TestRoot checks root directory is present and correct
+// TestVFSRoot checks root directory is present and correct
 func TestVFSRoot(t *testing.T) {
 	_, vfs := newTestVFS(t)
 
@@ -182,7 +179,7 @@ func TestVFSRoot(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, vfs.root, root)
 	assert.True(t, root.IsDir())
-	assert.Equal(t, vfs.Opt.DirPerms.Perm(), root.Mode().Perm())
+	assert.Equal(t, os.FileMode(vfs.Opt.DirPerms).Perm(), root.Mode().Perm())
 }
 
 func TestVFSStat(t *testing.T) {
@@ -488,4 +485,18 @@ func TestFillInMissingSizes(t *testing.T) {
 			assert.Equal(t, test.wantFree, gotFree, "free")
 		})
 	}
+}
+
+func TestVFSIsMetadataFile(t *testing.T) {
+	_, vfs := newTestVFS(t)
+
+	rawName, found := vfs.isMetadataFile("leaf.metadata")
+	assert.Equal(t, "leaf.metadata", rawName)
+	assert.Equal(t, false, found)
+
+	vfs.Opt.MetadataExtension = ".metadata"
+
+	rawName, found = vfs.isMetadataFile("leaf.metadata")
+	assert.Equal(t, "leaf", rawName)
+	assert.Equal(t, true, found)
 }

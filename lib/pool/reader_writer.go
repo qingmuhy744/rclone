@@ -1,8 +1,11 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"io"
+	"sync"
+	"time"
 )
 
 // RWAccount is a function which will be called after every read
@@ -12,15 +15,28 @@ import (
 type RWAccount func(n int) error
 
 // RW contains the state for the read/writer
+//
+// It can be used as a FIFO to read data from a source and write it out again.
 type RW struct {
-	pool       *Pool     // pool to get pages from
-	pages      [][]byte  // backing store
-	size       int       // size written
-	out        int       // offset we are reading from
-	lastOffset int       // size in last page
-	account    RWAccount // account for a read
-	reads      int       // count how many times the data has been read
-	accountOn  int       // only account on or after this read
+	// Written once variables in initialization
+	pool      *Pool     // pool to get pages from
+	account   RWAccount // account for a read
+	accountOn int       // only account on or after this read
+
+	// Shared variables between Read and Write
+	// Write updates these but Read reads from them
+	// They must all stay in sync together
+	mu         sync.Mutex    // protect the shared variables
+	pages      [][]byte      // backing store
+	size       int           // size written
+	lastOffset int           // size in last page
+	written    chan struct{} // signalled when a write happens
+
+	// Read side Variables
+	out   int // offset we are reading from
+	reads int // count how many times the data has been read
+
+	reserved [][]byte // reserved buffers
 }
 
 var (
@@ -37,16 +53,35 @@ var (
 //
 // When writing it only appends data. Seek only applies to reading.
 func NewRW(pool *Pool) *RW {
-	return &RW{
-		pool:  pool,
-		pages: make([][]byte, 0, 16),
+	rw := &RW{
+		pool:    pool,
+		pages:   make([][]byte, 0, 16),
+		written: make(chan struct{}, 1),
 	}
+	return rw
+}
+
+// Reserve bytes of memory.
+//
+// This allocates n bytes of memory for later use.
+//
+// This is rounded up to the nearest buffer page size.
+//
+// Only safe to call once.
+func (rw *RW) Reserve(n int64) *RW {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	buffers := int((n + int64(rw.pool.bufferSize) - 1) / int64(rw.pool.bufferSize))
+	rw.reserved = rw.pool.GetN(buffers)
+	return rw
 }
 
 // SetAccounting should be provided with a function which will be
 // called after every read from the RW.
 //
 // It may return an error which will be passed back to the user.
+//
+// Not thread safe - call in initialization only.
 func (rw *RW) SetAccounting(account RWAccount) *RW {
 	rw.account = account
 	return rw
@@ -73,6 +108,8 @@ type DelayAccountinger interface {
 // e.g. when calculating hashes.
 //
 // Set this to 0 to account everything.
+//
+// Not thread safe - call in initialization only.
 func (rw *RW) DelayAccounting(i int) {
 	rw.accountOn = i
 	rw.reads = 0
@@ -82,6 +119,8 @@ func (rw *RW) DelayAccounting(i int) {
 //
 // Ensure there are pages before calling this.
 func (rw *RW) readPage(i int) (page []byte) {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
 	// Count a read of the data if we read the first page
 	if i == 0 {
 		rw.reads++
@@ -111,6 +150,13 @@ func (rw *RW) accountRead(n int) error {
 	return nil
 }
 
+// Returns true if we have read to EOF
+func (rw *RW) eof() bool {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	return rw.out >= rw.size
+}
+
 // Read reads up to len(p) bytes into p. It returns the number of
 // bytes read (0 <= n <= len(p)) and any error encountered. If some
 // data is available but not len(p) bytes, Read returns what is
@@ -121,7 +167,7 @@ func (rw *RW) Read(p []byte) (n int, err error) {
 		page []byte
 	)
 	for len(p) > 0 {
-		if rw.out >= rw.size {
+		if rw.eof() {
 			return n, io.EOF
 		}
 		page = rw.readPage(rw.out)
@@ -148,7 +194,7 @@ func (rw *RW) WriteTo(w io.Writer) (n int64, err error) {
 		nn   int
 		page []byte
 	)
-	for rw.out < rw.size {
+	for !rw.eof() {
 		page = rw.readPage(rw.out)
 		nn, err = w.Write(page)
 		n += int64(nn)
@@ -166,10 +212,20 @@ func (rw *RW) WriteTo(w io.Writer) (n int64, err error) {
 
 // Get the page we are writing to
 func (rw *RW) writePage() (page []byte) {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
 	if len(rw.pages) > 0 && rw.lastOffset < rw.pool.bufferSize {
 		return rw.pages[len(rw.pages)-1][rw.lastOffset:]
 	}
-	page = rw.pool.Get()
+	if len(rw.reserved) > 0 {
+		// Get reserved pages if available
+		i := len(rw.reserved) - 1
+		page = rw.reserved[i]
+		rw.reserved[i] = nil
+		rw.reserved = rw.reserved[:i]
+	} else {
+		page = rw.pool.Get()
+	}
 	rw.pages = append(rw.pages, page)
 	rw.lastOffset = 0
 	return page
@@ -187,8 +243,11 @@ func (rw *RW) Write(p []byte) (n int, err error) {
 		nn = copy(page, p)
 		p = p[nn:]
 		n += nn
+		rw.mu.Lock()
 		rw.size += nn
 		rw.lastOffset += nn
+		rw.mu.Unlock()
+		rw.signalWrite() // signal more data available
 	}
 	return n, nil
 }
@@ -208,13 +267,39 @@ func (rw *RW) ReadFrom(r io.Reader) (n int64, err error) {
 		page = rw.writePage()
 		nn, err = r.Read(page)
 		n += int64(nn)
+		rw.mu.Lock()
 		rw.size += nn
 		rw.lastOffset += nn
+		rw.mu.Unlock()
+		rw.signalWrite() // signal more data available
 	}
 	if err == io.EOF {
 		err = nil
 	}
 	return n, err
+}
+
+// signal that a write has happened
+func (rw *RW) signalWrite() {
+	select {
+	case rw.written <- struct{}{}:
+	default:
+	}
+}
+
+// WaitWrite sleeps until a data is written to the RW or Close is
+// called or the context is cancelled occurs or for a maximum of 1
+// Second then returns.
+//
+// This can be used when calling Read while the buffer is filling up.
+func (rw *RW) WaitWrite(ctx context.Context) {
+	timer := time.NewTimer(time.Second)
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	case <-rw.written:
+	}
+	timer.Stop()
 }
 
 // Seek sets the offset for the next Read (not Write - this is always
@@ -229,7 +314,9 @@ func (rw *RW) ReadFrom(r io.Reader) (n int64, err error) {
 // beyond the end of the written data is an error.
 func (rw *RW) Seek(offset int64, whence int) (int64, error) {
 	var abs int64
+	rw.mu.Lock()
 	size := int64(rw.size)
+	rw.mu.Unlock()
 	switch whence {
 	case io.SeekStart:
 		abs = offset
@@ -252,15 +339,22 @@ func (rw *RW) Seek(offset int64, whence int) (int64, error) {
 
 // Close the buffer returning memory to the pool
 func (rw *RW) Close() error {
-	for _, page := range rw.pages {
-		rw.pool.Put(page)
-	}
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	rw.signalWrite() // signal more data available
+	rw.pool.PutN(rw.pages)
+	clear(rw.pages)
 	rw.pages = nil
+	rw.pool.PutN(rw.reserved)
+	clear(rw.reserved)
+	rw.reserved = nil
 	return nil
 }
 
 // Size returns the number of bytes in the buffer
 func (rw *RW) Size() int64 {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
 	return int64(rw.size)
 }
 

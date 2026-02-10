@@ -3,6 +3,7 @@ package accounting
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -47,9 +48,7 @@ func (tm *transferMap) del(remote string) bool {
 func (tm *transferMap) merge(m *transferMap) {
 	tm.mu.Lock()
 	m.mu.Lock()
-	for name, tr := range m.items {
-		tm.items[name] = tr
-	}
+	maps.Copy(tm.items, m.items)
 	m.mu.Unlock()
 	tm.mu.Unlock()
 }
@@ -159,11 +158,11 @@ func (tm *transferMap) rcStats(progress *inProgress) (t []rc.Params) {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 	for _, tr := range tm._sortedSlice() {
+		out := tr.rcStats() // basic stats
 		if acc := progress.get(tr.remote); acc != nil {
-			t = append(t, acc.rcStats())
-		} else {
-			t = append(t, tr.rcStats())
+			acc.rcStats(out) // add extended stats if have acc
 		}
+		t = append(t, out)
 	}
 	return t
 }

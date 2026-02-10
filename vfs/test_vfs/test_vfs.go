@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"math/rand"
 	"os"
@@ -16,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/lib/file"
 	"github.com/rclone/rclone/lib/random"
 )
@@ -28,12 +28,6 @@ var (
 	timeout    = flag.Duration("timeout", 10*time.Second, "Inactivity time to detect a deadlock")
 	testNumber atomic.Int32
 )
-
-// Seed the random number generator
-func init() {
-	rand.Seed(time.Now().UnixNano())
-
-}
 
 // Test contains stats about the running test which work for files or
 // directories
@@ -97,15 +91,15 @@ func (t *Test) randomTest() {
 }
 
 // logf logs things - not shown unless -v
-func (t *Test) logf(format string, a ...interface{}) {
+func (t *Test) logf(format string, a ...any) {
 	if *verbose {
-		log.Printf(t.prefix+format, a...)
+		fs.Logf(nil, t.prefix+format, a)
 	}
 }
 
 // errorf logs errors
-func (t *Test) errorf(format string, a ...interface{}) {
-	log.Printf(t.prefix+"ERROR: "+format, a...)
+func (t *Test) errorf(format string, a ...any) {
+	fs.Logf(nil, t.prefix+"ERROR: "+format, a)
 }
 
 // list test
@@ -273,7 +267,7 @@ func (t *Test) Tidy() {
 func (t *Test) RandomTests(iterations int, quit chan struct{}) {
 	var finished = make(chan struct{})
 	go func() {
-		for i := 0; i < iterations; i++ {
+		for range iterations {
 			t.randomTest()
 		}
 		close(finished)
@@ -292,7 +286,7 @@ func main() {
 	flag.Parse()
 	args := flag.Args()
 	if len(args) != 1 {
-		log.Fatalf("%s: Syntax [opts] <directory>", os.Args[0])
+		fs.Fatalf(nil, "%s: Syntax [opts] <directory>", os.Args[0])
 	}
 	dir := args[0]
 	_ = file.MkdirAll(dir, 0777)
@@ -301,7 +295,7 @@ func main() {
 		wg   sync.WaitGroup
 		quit = make(chan struct{}, *iterations)
 	)
-	for i := 0; i < *number; i++ {
+	for range *number {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

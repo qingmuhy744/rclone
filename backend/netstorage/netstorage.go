@@ -15,6 +15,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,7 +28,7 @@ import (
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
-	"github.com/rclone/rclone/fs/walk"
+	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -86,7 +87,7 @@ Please choose the 'y' option to set your own password then enter your secret.`,
 
 var commandHelp = []fs.CommandHelp{{
 	Name:  "du",
-	Short: "Return disk usage information for a specified directory",
+	Short: "Return disk usage information for a specified directory.",
 	Long: `The usage information returned, includes the targeted directory as well as all
 files stored in any sub-directories that may exist.`,
 }, {
@@ -95,7 +96,12 @@ files stored in any sub-directories that may exist.`,
 	Long: `The desired path location (including applicable sub-directories) ending in
 the object that will be the target of the symlink (for example, /links/mylink).
 Include the file extension for the object, if applicable.
-` + "`rclone backend symlink <src> <path>`",
+
+Usage example:
+
+` + "```console" + `
+rclone backend symlink <src> <path>
+` + "```",
 },
 }
 
@@ -260,6 +266,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	case fs.ErrorObjectNotFound:
 		return f, nil
 	case fs.ErrorIsFile:
+		// Correct root if definitely pointing to a file
+		f.root = path.Dir(f.root)
+		if f.root == "." || f.root == "/" {
+			f.root = ""
+		}
 		// Fs points to the parent directory
 		return f, err
 	default:
@@ -268,7 +279,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 }
 
 // Command the backend to run a named commands: du and symlink
-func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out interface{}, err error) {
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
 	switch name {
 	case "du":
 		// No arg parsing needed, the path is passed in the fs
@@ -437,7 +448,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	}
 
 	URL := f.url(dir)
-	files, err := f.netStorageDirRequest(ctx, dir, URL)
+	files, err := f.netStorageDirRequest(ctx, URL)
 	if err != nil {
 		return nil, err
 	}
@@ -510,7 +521,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 		return fs.ErrorDirNotFound
 	}
 
-	list := walk.NewListRHelper(callback)
+	list := list.NewHelper(callback)
 	for resumeStart := u.Path; resumeStart != ""; {
 		var files []File
 		files, resumeStart, err = f.netStorageListRequest(ctx, URL, u.Path)
@@ -852,7 +863,7 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 
 // callBackend calls NetStorage API using either rest.Call or rest.CallXML function,
 // depending on whether the response is required
-func (f *Fs) callBackend(ctx context.Context, URL, method, actionHeader string, noResponse bool, response interface{}, options []fs.OpenOption) (io.ReadCloser, error) {
+func (f *Fs) callBackend(ctx context.Context, URL, method, actionHeader string, noResponse bool, response any, options []fs.OpenOption) (io.ReadCloser, error) {
 	opts := rest.Opts{
 		Method:     method,
 		RootURL:    URL,
@@ -917,16 +928,14 @@ func (f *Fs) netStorageStatRequest(ctx context.Context, URL string, directory bo
 		entrywanted := (directory && files[i].Type == "dir") ||
 			(!directory && files[i].Type != "dir")
 		if entrywanted {
-			filestamp := files[0]
-			files[0] = files[i]
-			files[i] = filestamp
+			files[0], files[i] = files[i], files[0]
 		}
 	}
 	return files, nil
 }
 
 // netStorageDirRequest performs a NetStorage dir request
-func (f *Fs) netStorageDirRequest(ctx context.Context, dir string, URL string) ([]File, error) {
+func (f *Fs) netStorageDirRequest(ctx context.Context, URL string) ([]File, error) {
 	const actionHeader = "version=1&action=dir&format=xml&encoding=utf-8"
 	statResp := &Stat{}
 	if _, err := f.callBackend(ctx, URL, "GET", actionHeader, false, statResp, nil); err != nil {
@@ -1076,7 +1085,7 @@ func (o *Object) netStorageDownloadRequest(ctx context.Context, options []fs.Ope
 }
 
 // netStorageDuRequest performs a NetStorage du request
-func (f *Fs) netStorageDuRequest(ctx context.Context) (interface{}, error) {
+func (f *Fs) netStorageDuRequest(ctx context.Context) (any, error) {
 	URL := f.url("")
 	const actionHeader = "version=1&action=du&format=xml&encoding=utf-8"
 	duResp := &Du{}
@@ -1096,7 +1105,7 @@ func (f *Fs) netStorageDuRequest(ctx context.Context) (interface{}, error) {
 }
 
 // netStorageDuRequest performs a NetStorage symlink request
-func (f *Fs) netStorageSymlinkRequest(ctx context.Context, URL string, dst string, modTime *int64) (interface{}, error) {
+func (f *Fs) netStorageSymlinkRequest(ctx context.Context, URL string, dst string, modTime *int64) (any, error) {
 	target := url.QueryEscape(strings.TrimSuffix(dst, "/"))
 	actionHeader := "version=1&action=symlink&target=" + target
 	if modTime != nil {

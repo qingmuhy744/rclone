@@ -3,15 +3,20 @@ package filter
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"log"
+	"math/rand/v2"
 	"path"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/rclone/rclone/fs"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/text/unicode/norm"
 )
 
 // This is the globally active filter
@@ -19,24 +24,143 @@ import (
 // This is accessed through GetConfig and AddConfig
 var globalConfig = mustNewFilter(nil)
 
-// Opt configures the filter
-type Opt struct {
-	DeleteExcluded bool
-	RulesOpt       // embedded so we don't change the JSON API
-	ExcludeFile    []string
-	FilesFrom      []string
-	FilesFromRaw   []string
-	MetaRules      RulesOpt
-	MinAge         fs.Duration
-	MaxAge         fs.Duration
-	MinSize        fs.SizeSuffix
-	MaxSize        fs.SizeSuffix
-	IgnoreCase     bool
+// OptionsInfo describes the Options in use
+var OptionsInfo = fs.Options{{
+	Name:    "delete_excluded",
+	Default: false,
+	Help:    "Delete files on dest excluded from sync",
+	Groups:  "Filter",
+}, {
+	Name:    "exclude_if_present",
+	Default: []string{},
+	Help:    "Exclude directories if filename is present",
+	Groups:  "Filter",
+}, {
+	Name:    "files_from",
+	Default: []string{},
+	Help:    "Read list of source-file names from file (use - to read from stdin)",
+	Groups:  "Filter",
+}, {
+	Name:    "files_from_raw",
+	Default: []string{},
+	Help:    "Read list of source-file names from file without any processing of lines (use - to read from stdin)",
+	Groups:  "Filter",
+}, {
+	Name:    "min_age",
+	Default: fs.DurationOff,
+	Help:    "Only transfer files older than this in s or suffix ms|s|m|h|d|w|M|y",
+	Groups:  "Filter",
+}, {
+	Name:    "max_age",
+	Default: fs.DurationOff,
+	Help:    "Only transfer files younger than this in s or suffix ms|s|m|h|d|w|M|y",
+	Groups:  "Filter",
+}, {
+	Name:    "min_size",
+	Default: fs.SizeSuffix(-1),
+	Help:    "Only transfer files bigger than this in KiB or suffix B|K|M|G|T|P",
+	Groups:  "Filter",
+}, {
+	Name:    "max_size",
+	Default: fs.SizeSuffix(-1),
+	Help:    "Only transfer files smaller than this in KiB or suffix B|K|M|G|T|P",
+	Groups:  "Filter",
+}, {
+	Name:    "ignore_case",
+	Default: false,
+	Help:    "Ignore case in filters (case insensitive)",
+	Groups:  "Filter",
+}, {
+	Name:    "hash_filter",
+	Default: "",
+	Help:    "Partition filenames by hash k/n or randomly @/n",
+	Groups:  "Filter",
+}, {
+	Name:     "filter",
+	Default:  []string{},
+	ShortOpt: "f",
+	Help:     "Add a file filtering rule",
+	Groups:   "Filter",
+}, {
+	Name:    "filter_from",
+	Default: []string{},
+	Help:    "Read file filtering patterns from a file (use - to read from stdin)",
+	Groups:  "Filter",
+}, {
+	Name:    "exclude",
+	Default: []string{},
+	Help:    "Exclude files matching pattern",
+	Groups:  "Filter",
+}, {
+	Name:    "exclude_from",
+	Default: []string{},
+	Help:    "Read file exclude patterns from file (use - to read from stdin)",
+	Groups:  "Filter",
+}, {
+	Name:    "include",
+	Default: []string{},
+	Help:    "Include files matching pattern",
+	Groups:  "Filter",
+}, {
+	Name:    "include_from",
+	Default: []string{},
+	Help:    "Read file include patterns from file (use - to read from stdin)",
+	Groups:  "Filter",
+}, {
+	Name:    "metadata_filter",
+	Default: []string{},
+	Help:    "Add a metadata filtering rule",
+	Groups:  "Filter,Metadata",
+}, {
+	Name:    "metadata_filter_from",
+	Default: []string{},
+	Help:    "Read metadata filtering patterns from a file (use - to read from stdin)",
+	Groups:  "Filter,Metadata",
+}, {
+	Name:    "metadata_exclude",
+	Default: []string{},
+	Help:    "Exclude metadatas matching pattern",
+	Groups:  "Filter,Metadata",
+}, {
+	Name:    "metadata_exclude_from",
+	Default: []string{},
+	Help:    "Read metadata exclude patterns from file (use - to read from stdin)",
+	Groups:  "Filter,Metadata",
+}, {
+	Name:    "metadata_include",
+	Default: []string{},
+	Help:    "Include metadatas matching pattern",
+	Groups:  "Filter,Metadata",
+}, {
+	Name:    "metadata_include_from",
+	Default: []string{},
+	Help:    "Read metadata include patterns from file (use - to read from stdin)",
+	Groups:  "Filter,Metadata",
+}}
+
+// Options configures the filter
+type Options struct {
+	DeleteExcluded bool          `config:"delete_excluded"`
+	RulesOpt                     // embedded so we don't change the JSON API
+	ExcludeFile    []string      `config:"exclude_if_present"`
+	FilesFrom      []string      `config:"files_from"`
+	FilesFromRaw   []string      `config:"files_from_raw"`
+	MetaRules      RulesOpt      `config:"metadata"`
+	MinAge         fs.Duration   `config:"min_age"`
+	MaxAge         fs.Duration   `config:"max_age"`
+	MinSize        fs.SizeSuffix `config:"min_size"`
+	MaxSize        fs.SizeSuffix `config:"max_size"`
+	IgnoreCase     bool          `config:"ignore_case"`
+	HashFilter     string        `config:"hash_filter"`
 }
 
-// DefaultOpt is the default config for the filter
-var DefaultOpt = Opt{
-	MinAge:  fs.DurationOff,
+func init() {
+	fs.RegisterGlobalOptions(fs.OptionsInfo{Name: "filter", Opt: &Opt, Options: OptionsInfo, Reload: Reload})
+}
+
+// Opt is the default config for the filter
+var Opt = Options{
+	MinAge:  fs.DurationOff, // These have to be set here as the options are parsed once before the defaults are set
 	MaxAge:  fs.DurationOff,
 	MinSize: fs.SizeSuffix(-1),
 	MaxSize: fs.SizeSuffix(-1),
@@ -47,7 +171,7 @@ type FilesMap map[string]struct{}
 
 // Filter describes any filtering in operation
 type Filter struct {
-	Opt         Opt
+	Opt         Options
 	ModTimeFrom time.Time
 	ModTimeTo   time.Time
 	fileRules   rules
@@ -55,18 +179,20 @@ type Filter struct {
 	metaRules   rules
 	files       FilesMap // files if filesFrom
 	dirs        FilesMap // dirs from filesFrom
+	hashFilterN uint64   // if non 0 do hash filtering
+	hashFilterK uint64   // select partition K/N
 }
 
 // NewFilter parses the command line options and creates a Filter
 // object.  If opt is nil, then DefaultOpt will be used
-func NewFilter(opt *Opt) (f *Filter, err error) {
+func NewFilter(opt *Options) (f *Filter, err error) {
 	f = &Filter{}
 
 	// Make a copy of the options
 	if opt != nil {
 		f.Opt = *opt
 	} else {
-		f.Opt = DefaultOpt
+		f.Opt = Opt
 	}
 
 	// Filter flags
@@ -77,9 +203,16 @@ func NewFilter(opt *Opt) (f *Filter, err error) {
 	if f.Opt.MaxAge.IsSet() {
 		f.ModTimeFrom = time.Now().Add(-time.Duration(f.Opt.MaxAge))
 		if !f.ModTimeTo.IsZero() && f.ModTimeTo.Before(f.ModTimeFrom) {
-			log.Fatal("filter: --min-age can't be larger than --max-age")
+			return nil, fmt.Errorf("filter: --min-age %q can't be larger than --max-age %q", opt.MinAge, opt.MaxAge)
 		}
 		fs.Debugf(nil, "--max-age %v to %v", f.Opt.MaxAge, f.ModTimeFrom)
+	}
+	if f.Opt.HashFilter != "" {
+		f.hashFilterK, f.hashFilterN, err = parseHashFilter(f.Opt.HashFilter)
+		if err != nil {
+			return nil, err
+		}
+		fs.Debugf(nil, "Using --hash-filter %d/%d", f.hashFilterK, f.hashFilterN)
 	}
 
 	err = parseRules(&f.Opt.RulesOpt, f.Add, f.Clear)
@@ -130,7 +263,33 @@ func NewFilter(opt *Opt) (f *Filter, err error) {
 	return f, nil
 }
 
-func mustNewFilter(opt *Opt) *Filter {
+// Parse the --hash-filter arguments into k/n
+func parseHashFilter(hashFilter string) (k, n uint64, err error) {
+	slash := strings.IndexRune(hashFilter, '/')
+	if slash < 0 {
+		return 0, 0, fmt.Errorf("filter: --hash-filter: no / found")
+	}
+	kStr, nStr := hashFilter[:slash], hashFilter[slash+1:]
+	n, err = strconv.ParseUint(nStr, 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("filter: --hash-filter: can't parse N=%q: %v", nStr, err)
+	}
+	if n == 0 {
+		return 0, 0, fmt.Errorf("filter: --hash-filter: N must be greater than 0")
+	}
+	if kStr == "@" {
+		k = rand.Uint64N(n)
+	} else {
+		k, err = strconv.ParseUint(kStr, 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("filter: --hash-filter: can't parse K=%q: %v", kStr, err)
+		}
+		k %= n
+	}
+	return k, n, nil
+}
+
+func mustNewFilter(opt *Options) *Filter {
 	f, err := NewFilter(opt)
 	if err != nil {
 		panic(err)
@@ -145,7 +304,7 @@ func (f *Filter) addDirGlobs(Include bool, glob string) error {
 		if dirGlob == "/" {
 			continue
 		}
-		dirRe, err := GlobToRegexp(dirGlob, f.Opt.IgnoreCase)
+		dirRe, err := GlobPathToRegexp(dirGlob, f.Opt.IgnoreCase)
 		if err != nil {
 			return err
 		}
@@ -165,7 +324,7 @@ func (f *Filter) Add(Include bool, glob string) error {
 	if strings.Contains(glob, "**") {
 		isDirRule, isFileRule = true, true
 	}
-	re, err := GlobToRegexp(glob, f.Opt.IgnoreCase)
+	re, err := GlobPathToRegexp(glob, f.Opt.IgnoreCase)
 	if err != nil {
 		return err
 	}
@@ -254,7 +413,8 @@ func (f *Filter) InActive() bool {
 		f.fileRules.len() == 0 &&
 		f.dirRules.len() == 0 &&
 		f.metaRules.len() == 0 &&
-		len(f.Opt.ExcludeFile) == 0)
+		len(f.Opt.ExcludeFile) == 0 &&
+		f.hashFilterN == 0)
 }
 
 // IncludeRemote returns whether this remote passes the filter rules.
@@ -263,6 +423,21 @@ func (f *Filter) IncludeRemote(remote string) bool {
 	if f.files != nil {
 		_, include := f.files[remote]
 		return include
+	}
+	if f.hashFilterN != 0 {
+		// Normalise the remote first in case we are using a
+		// case insensitive remote or a remote which needs
+		// unicode normalisation. This means all the remotes
+		// which could be normalised together will be in the
+		// same partition.
+		normalized := norm.NFC.String(remote)
+		normalized = strings.ToLower(normalized)
+		hashBytes := md5.Sum([]byte(normalized))
+		hash := binary.LittleEndian.Uint64(hashBytes[:])
+		partition := hash % f.hashFilterN
+		if partition != f.hashFilterK {
+			return false
+		}
 	}
 	return f.fileRules.include(remote)
 }
@@ -276,10 +451,8 @@ func (f *Filter) ListContainsExcludeFile(entries fs.DirEntries) bool {
 		obj, ok := entry.(fs.Object)
 		if ok {
 			basename := path.Base(obj.Remote())
-			for _, excludeFile := range f.Opt.ExcludeFile {
-				if basename == excludeFile {
-					return true
-				}
+			if slices.Contains(f.Opt.ExcludeFile, basename) {
+				return true
 			}
 		}
 	}
@@ -330,23 +503,30 @@ func (f *Filter) DirContainsExcludeFile(ctx context.Context, fremote fs.Fs, remo
 }
 
 // Include returns whether this object should be included into the
-// sync or not
+// sync or not and logs the reason for exclusion if not included
 func (f *Filter) Include(remote string, size int64, modTime time.Time, metadata fs.Metadata) bool {
 	// filesFrom takes precedence
 	if f.files != nil {
 		_, include := f.files[remote]
+		if !include {
+			fs.Debugf(remote, "Excluded (FilesFrom Filter)")
+		}
 		return include
 	}
 	if !f.ModTimeFrom.IsZero() && modTime.Before(f.ModTimeFrom) {
+		fs.Debugf(remote, "Excluded (ModTime Filter)")
 		return false
 	}
 	if !f.ModTimeTo.IsZero() && modTime.After(f.ModTimeTo) {
+		fs.Debugf(remote, "Excluded (ModTime Filter)")
 		return false
 	}
 	if f.Opt.MinSize >= 0 && size < int64(f.Opt.MinSize) {
+		fs.Debugf(remote, "Excluded (Size Filter)")
 		return false
 	}
 	if f.Opt.MaxSize >= 0 && size > int64(f.Opt.MaxSize) {
+		fs.Debugf(remote, "Excluded (Size Filter)")
 		return false
 	}
 	if f.metaRules.len() > 0 {
@@ -360,10 +540,15 @@ func (f *Filter) Include(remote string, size int64, modTime time.Time, metadata 
 			metadatas = append(metadatas, "\x00=\x00")
 		}
 		if !f.metaRules.includeMany(metadatas) {
+			fs.Debugf(remote, "Excluded (Metadata Filter)")
 			return false
 		}
 	}
-	return f.IncludeRemote(remote)
+	include := f.IncludeRemote(remote)
+	if !include {
+		fs.Debugf(remote, "Excluded (Path Filter)")
+	}
+	return include
 }
 
 // IncludeObject returns whether this object should be included into
@@ -398,6 +583,12 @@ func (f *Filter) DumpFilters() string {
 	}
 	if !f.ModTimeTo.IsZero() {
 		rules = append(rules, fmt.Sprintf("Last-modified date must be equal or less than: %s", f.ModTimeTo.String()))
+	}
+	if f.Opt.MinSize >= 0 {
+		rules = append(rules, fmt.Sprintf("Minimum size is: %s", f.Opt.MinSize.ByteUnit()))
+	}
+	if f.Opt.MaxSize >= 0 {
+		rules = append(rules, fmt.Sprintf("Maximum size is: %s", f.Opt.MaxSize.ByteUnit()))
 	}
 	rules = append(rules, "--- File filter rules ---")
 	for _, rule := range f.fileRules.rules {
@@ -435,7 +626,7 @@ func (f *Filter) MakeListR(ctx context.Context, NewObject func(ctx context.Conte
 			remotes  = make(chan string, checkers)
 			g, gCtx  = errgroup.WithContext(ctx)
 		)
-		for i := 0; i < checkers; i++ {
+		for range checkers {
 			g.Go(func() (err error) {
 				var entries = make(fs.DirEntries, 1)
 				for remote := range remotes {
@@ -555,4 +746,15 @@ func SetUseFilter(ctx context.Context, useFilter bool) context.Context {
 	pVal := new(bool)
 	*pVal = useFilter
 	return context.WithValue(ctx, useFlagContextKey, pVal)
+}
+
+// Reload the filters from the flags
+func Reload(ctx context.Context) (err error) {
+	fi := GetConfig(ctx)
+	newFilter, err := NewFilter(&Opt)
+	if err != nil {
+		return err
+	}
+	*fi = *newFilter
+	return nil
 }

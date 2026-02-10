@@ -4,11 +4,11 @@ package cat
 import (
 	"context"
 	"io"
-	"log"
 	"os"
 	"strings"
 
 	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/spf13/cobra"
@@ -39,20 +39,25 @@ var commandDefinition = &cobra.Command{
 	Use:   "cat remote:path",
 	Short: `Concatenates any files and sends them to stdout.`,
 	// Warning! "|" will be replaced by backticks below
-	Long: strings.ReplaceAll(`
-rclone cat sends any files to standard output.
+	Long: strings.ReplaceAll(`Sends any files to standard output.
 
 You can use it like this to output a single file
 
-    rclone cat remote:path/to/file
+|||sh
+rclone cat remote:path/to/file
+|||
 
 Or like this to output any file in dir or its subdirectories.
 
-    rclone cat remote:path/to/dir
+|||sh
+rclone cat remote:path/to/dir
+|||
 
 Or like this to output any .txt files in dir or its subdirectories.
 
-    rclone --include "*.txt" cat remote:path/to/dir
+|||sh
+rclone --include "*.txt" cat remote:path/to/dir
+|||
 
 Use the |--head| flag to print characters only at the start, |--tail| for
 the end and |--offset| and |--count| to print a section in the middle.
@@ -63,14 +68,17 @@ Use the |--separator| flag to print a separator value between files. Be sure to
 shell-escape special characters. For example, to print a newline between
 files, use:
 
-* bash:
+- bash:
 
-      rclone --include "*.txt" --separator $'\n' cat remote:path/to/dir
+  |||sh
+  rclone --include "*.txt" --separator $'\n' cat remote:path/to/dir
+  |||
 
-* powershell:
+- powershell:
 
-      rclone --include "*.txt" --separator "|n" cat remote:path/to/dir
-`, "|", "`"),
+  |||powershell
+  rclone --include "*.txt" --separator "|n" cat remote:path/to/dir
+  |||`, "|", "`"),
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.33",
 		"groups":            "Filter,Listing",
@@ -80,7 +88,7 @@ files, use:
 		usedHead := head > 0
 		usedTail := tail > 0
 		if usedHead && usedTail || usedHead && usedOffset || usedTail && usedOffset {
-			log.Fatalf("Can only use one of  --head, --tail or --offset with --count")
+			fs.Fatalf(nil, "Can only use one of  --head, --tail or --offset with --count")
 		}
 		if head > 0 {
 			offset = 0

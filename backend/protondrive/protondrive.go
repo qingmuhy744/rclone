@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
-	protonDriveAPI "github.com/henrybear327/Proton-API-Bridge"
-	"github.com/henrybear327/go-proton-api"
+	protonDriveAPI "github.com/rclone/Proton-API-Bridge"
+	"github.com/rclone/go-proton-api"
+
+	"github.com/pquerna/otp/totp"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -87,6 +89,17 @@ The value can also be provided with --protondrive-2fa=000000
 The 2FA code of your proton drive account if the account is set up with 
 two-factor authentication`,
 			Required: false,
+		}, {
+			Name: "otp_secret_key",
+			Help: `The OTP secret key
+
+The value can also be provided with --protondrive-otp-secret-key=ABCDEFGHIJKLMNOPQRSTUVWXYZ234567
+
+The OTP secret key of your proton drive account if the account is set up with 
+two-factor authentication`,
+			Required:   false,
+			Sensitive:  true,
+			IsPassword: true,
 		}, {
 			Name:      clientUIDKey,
 			Help:      "Client uid key (internal use only)",
@@ -191,6 +204,7 @@ type Options struct {
 	Password        string `config:"password"`
 	MailboxPassword string `config:"mailbox_password"`
 	TwoFA           string `config:"2fa"`
+	OtpSecretKey    string `config:"otp_secret_key"`
 
 	// advanced
 	Enc                  encoder.MultiEncoder `config:"encoding"`
@@ -244,7 +258,7 @@ func (f *Fs) Name() string {
 
 // Root of the remote (as passed into NewFs)
 func (f *Fs) Root() string {
-	return f.root
+	return f.opt.Enc.ToStandardPath(f.root)
 }
 
 // String converts this Fs to a string
@@ -284,6 +298,9 @@ func getConfigMap(m configmap.Mapper) (uid, accessToken, refreshToken, saltedKey
 		return
 	}
 	_saltedKeyPass = saltedKeyPass
+
+	// empty strings are considered "ok" by m.Get, which is not true business-wise
+	ok = accessToken != "" && uid != "" && refreshToken != "" && saltedKeyPass != ""
 
 	return
 }
@@ -353,7 +370,15 @@ func newProtonDrive(ctx context.Context, f *Fs, opt *Options, m configmap.Mapper
 	config.FirstLoginCredential.Username = opt.Username
 	config.FirstLoginCredential.Password = opt.Password
 	config.FirstLoginCredential.MailboxPassword = opt.MailboxPassword
+	// if 2FA code is provided, use it; otherwise, generate one using the OTP secret key if provided
 	config.FirstLoginCredential.TwoFA = opt.TwoFA
+	if opt.TwoFA == "" && opt.OtpSecretKey != "" {
+		code, err := totp.GenerateCode(opt.OtpSecretKey, time.Now())
+		if err != nil {
+			return nil, fmt.Errorf("couldn't generate 2FA code: %w", err)
+		}
+		config.FirstLoginCredential.TwoFA = code
+	}
 	protonDrive, auth, err := protonDriveAPI.NewProtonDrive(ctx, config, authHandler, deAuthHandler)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't initialize a new proton drive instance: %w", err)
@@ -389,6 +414,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt.MailboxPassword, err = obscure.Reveal(opt.MailboxPassword)
 		if err != nil {
 			return nil, fmt.Errorf("couldn't decrypt mailbox password: %w", err)
+		}
+	}
+
+	if opt.OtpSecretKey != "" {
+		var err error
+		opt.OtpSecretKey, err = obscure.Reveal(opt.OtpSecretKey)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't decrypt OtpSecretKey: %w", err)
 		}
 	}
 
@@ -446,7 +479,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			// No root so return old f
 			return f, nil
 		}
-		_, err := tempF.newObjectWithLink(ctx, remote, nil)
+		_, err := tempF.newObject(ctx, remote)
 		if err != nil {
 			if err == fs.ErrorObjectNotFound {
 				// File doesn't exist so return old f
@@ -484,7 +517,7 @@ func (f *Fs) CleanUp(ctx context.Context) error {
 // ErrorIsDir if possible without doing any extra work,
 // otherwise ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	return f.newObjectWithLink(ctx, remote, nil)
+	return f.newObject(ctx, remote)
 }
 
 func (f *Fs) getObjectLink(ctx context.Context, remote string) (*proton.Link, error) {
@@ -513,35 +546,27 @@ func (f *Fs) getObjectLink(ctx context.Context, remote string) (*proton.Link, er
 	return link, nil
 }
 
-// readMetaDataForRemote reads the metadata from the remote
-func (f *Fs) readMetaDataForRemote(ctx context.Context, remote string, _link *proton.Link) (*proton.Link, *protonDriveAPI.FileSystemAttrs, error) {
-	link, err := f.getObjectLink(ctx, remote)
-	if err != nil {
-		return nil, nil, err
-	}
-
+// readMetaDataForLink reads the metadata from the remote
+func (f *Fs) readMetaDataForLink(ctx context.Context, link *proton.Link) (*protonDriveAPI.FileSystemAttrs, error) {
 	var fileSystemAttrs *protonDriveAPI.FileSystemAttrs
+	var err error
 	if err = f.pacer.Call(func() (bool, error) {
 		fileSystemAttrs, err = f.protonDrive.GetActiveRevisionAttrs(ctx, link)
 		return shouldRetry(ctx, err)
 	}); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	return link, fileSystemAttrs, nil
+	return fileSystemAttrs, nil
 }
 
-// readMetaData gets the metadata if it hasn't already been fetched
+// Return an Object from a path and link
 //
-// it also sets the info
-func (o *Object) readMetaData(ctx context.Context, link *proton.Link) (err error) {
-	if o.link != nil {
-		return nil
-	}
-
-	link, fileSystemAttrs, err := o.fs.readMetaDataForRemote(ctx, o.remote, link)
-	if err != nil {
-		return err
+// If it can't be found it returns the error fs.ErrorObjectNotFound.
+func (f *Fs) newObjectWithLink(ctx context.Context, remote string, link *proton.Link) (fs.Object, error) {
+	o := &Object{
+		fs:     f,
+		remote: remote,
 	}
 
 	o.id = link.LinkID
@@ -551,6 +576,10 @@ func (o *Object) readMetaData(ctx context.Context, link *proton.Link) (err error
 	o.mimetype = link.MIMEType
 	o.link = link
 
+	fileSystemAttrs, err := o.fs.readMetaDataForLink(ctx, link)
+	if err != nil {
+		return nil, err
+	}
 	if fileSystemAttrs != nil {
 		o.modTime = fileSystemAttrs.ModificationTime
 		o.originalSize = &fileSystemAttrs.Size
@@ -558,23 +587,18 @@ func (o *Object) readMetaData(ctx context.Context, link *proton.Link) (err error
 		o.digests = &fileSystemAttrs.Digests
 	}
 
-	return nil
+	return o, nil
 }
 
-// Return an Object from a path
+// Return an Object from a path only
 //
 // If it can't be found it returns the error fs.ErrorObjectNotFound.
-func (f *Fs) newObjectWithLink(ctx context.Context, remote string, link *proton.Link) (fs.Object, error) {
-	o := &Object{
-		fs:     f,
-		remote: remote,
-	}
-
-	err := o.readMetaData(ctx, link)
+func (f *Fs) newObject(ctx context.Context, remote string) (fs.Object, error) {
+	link, err := f.getObjectLink(ctx, remote)
 	if err != nil {
 		return nil, err
 	}
-	return o, nil
+	return f.newObjectWithLink(ctx, remote, link)
 }
 
 // List the objects and directories in dir into entries.  The

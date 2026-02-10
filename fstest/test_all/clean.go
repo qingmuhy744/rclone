@@ -5,29 +5,29 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"regexp"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/fs/operations"
+	"github.com/rclone/rclone/fstest/runs"
 )
 
 // MatchTestRemote matches the remote names used for testing (copied
 // from fstest/fstest.go so we don't have to import that and get all
 // its flags)
-var MatchTestRemote = regexp.MustCompile(`^rclone-test-[abcdefghijklmnopqrstuvwxyz0123456789]{24}(_segments)?$`)
+var MatchTestRemote = regexp.MustCompile(`^rclone-test-[abcdefghijklmnopqrstuvwxyz0123456789]{12,24}(_segments)?$`)
 
 // cleanFs runs a single clean fs for left over directories
-func cleanFs(ctx context.Context, remote string, cleanup bool) error {
+func cleanFs(ctx context.Context, remote string, cleanup bool, Opt runs.RunOpt) error {
 	f, err := fs.NewFs(context.Background(), remote)
 	if err != nil {
 		return err
 	}
 	var lastErr error
 	if cleanup {
-		log.Printf("%q - running cleanup", remote)
+		fs.Logf(nil, "%q - running cleanup", remote)
 		err = operations.CleanUp(ctx, f)
 		if err != nil {
 			lastErr = err
@@ -42,11 +42,11 @@ func cleanFs(ctx context.Context, remote string, cleanup bool) error {
 		dirPath := dir.Remote()
 		fullPath := fspath.JoinRootPath(remote, dirPath)
 		if MatchTestRemote.MatchString(dirPath) {
-			if *dryRun {
-				log.Printf("Not Purging %s - -dry-run", fullPath)
+			if Opt.DryRun {
+				fs.Logf(nil, "Not Purging %s - -dry-run", fullPath)
 				return nil
 			}
-			log.Printf("Purging %s", fullPath)
+			fs.Logf(nil, "Purging %s", fullPath)
 			dir, err := fs.NewFs(context.Background(), fullPath)
 			if err != nil {
 				err = fmt.Errorf("NewFs failed: %w", err)
@@ -71,15 +71,15 @@ func cleanFs(ctx context.Context, remote string, cleanup bool) error {
 }
 
 // cleanRemotes cleans the list of remotes passed in
-func cleanRemotes(conf *Config) error {
+func cleanRemotes(conf *runs.Config, Opt runs.RunOpt) error {
 	var lastError error
 	for _, backend := range conf.Backends {
 		remote := backend.Remote
-		log.Printf("%q - Cleaning", remote)
-		err := cleanFs(context.Background(), remote, backend.CleanUp)
+		fs.Logf(nil, "%q - Cleaning", remote)
+		err := cleanFs(context.Background(), remote, backend.CleanUp, Opt)
 		if err != nil {
 			lastError = err
-			log.Printf("Failed to purge %q: %v", remote, err)
+			fs.Logf(nil, "Failed to purge %q: %v", remote, err)
 		}
 	}
 	return lastError

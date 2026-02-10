@@ -1,6 +1,4 @@
-//go:build cmount && ((linux && cgo) || (darwin && cgo) || (freebsd && cgo) || windows)
-// +build cmount
-// +build linux,cgo darwin,cgo freebsd,cgo windows
+//go:build cmount && ((linux && cgo) || (darwin && cgo) || (freebsd && cgo) || (openbsd && cgo) || windows)
 
 // Package cmount implements a FUSE mounting system for rclone remotes.
 //
@@ -37,24 +35,11 @@ func init() {
 	buildinfo.Tags = append(buildinfo.Tags, "cmount")
 }
 
-// Find the option string in the current options
-func findOption(name string, options []string) (found bool) {
-	for _, option := range options {
-		if option == "-o" {
-			continue
-		}
-		if strings.Contains(option, name) {
-			return true
-		}
-	}
-	return false
-}
-
 // mountOptions configures the options from the command line flags
 func mountOptions(VFS *vfs.VFS, device string, mountpoint string, opt *mountlib.Options) (options []string) {
 	// Options
 	options = []string{
-		"-o", fmt.Sprintf("attr_timeout=%g", opt.AttrTimeout.Seconds()),
+		"-o", fmt.Sprintf("attr_timeout=%g", time.Duration(opt.AttrTimeout).Seconds()),
 	}
 	if opt.DebugFUSE {
 		options = append(options, "-o", "debug")
@@ -74,14 +59,16 @@ func mountOptions(VFS *vfs.VFS, device string, mountpoint string, opt *mountlib.
 	} else {
 		options = append(options, "-o", "fsname="+device)
 		options = append(options, "-o", "subtype=rclone")
-		options = append(options, "-o", fmt.Sprintf("max_readahead=%d", opt.MaxReadAhead))
-		// This causes FUSE to supply O_TRUNC with the Open
-		// call which is more efficient for cmount.  However
-		// it does not work with cgofuse on Windows with
-		// WinFSP so cmount must work with or without it.
-		options = append(options, "-o", "atomic_o_trunc")
+		if runtime.GOOS != "openbsd" {
+			options = append(options, "-o", fmt.Sprintf("max_readahead=%d", opt.MaxReadAhead))
+			// This causes FUSE to supply O_TRUNC with the Open
+			// call which is more efficient for cmount.  However
+			// it does not work with cgofuse on Windows with
+			// WinFSP so cmount must work with or without it.
+			options = append(options, "-o", "atomic_o_trunc")
+		}
 		if opt.DaemonTimeout != 0 {
-			options = append(options, "-o", fmt.Sprintf("daemon_timeout=%d", int(opt.DaemonTimeout.Seconds())))
+			options = append(options, "-o", fmt.Sprintf("daemon_timeout=%d", int(time.Duration(opt.DaemonTimeout).Seconds())))
 		}
 		if opt.AllowOther {
 			options = append(options, "-o", "allow_other")
@@ -95,9 +82,9 @@ func mountOptions(VFS *vfs.VFS, device string, mountpoint string, opt *mountlib.
 		if VFS.Opt.ReadOnly {
 			options = append(options, "-o", "ro")
 		}
-		if opt.WritebackCache {
-			// FIXME? options = append(options, "-o", WritebackCache())
-		}
+		//if opt.WritebackCache {
+		// FIXME? options = append(options, "-o", WritebackCache())
+		//}
 		if runtime.GOOS == "darwin" {
 			if opt.VolumeName != "" {
 				options = append(options, "-o", "volname="+opt.VolumeName)
@@ -113,16 +100,7 @@ func mountOptions(VFS *vfs.VFS, device string, mountpoint string, opt *mountlib.
 	for _, option := range opt.ExtraOptions {
 		options = append(options, "-o", option)
 	}
-	for _, option := range opt.ExtraFlags {
-		options = append(options, option)
-	}
-	if runtime.GOOS == "darwin" {
-		if !findOption("modules=iconv", options) {
-			iconv := "modules=iconv,from_code=UTF-8,to_code=UTF-8-MAC"
-			options = append(options, "-o", iconv)
-			fs.Debugf(nil, "Adding \"-o %s\" for macOS", iconv)
-		}
-	}
+	options = append(options, opt.ExtraFlags...)
 	return options
 }
 
@@ -156,7 +134,7 @@ func mount(VFS *vfs.VFS, mountPath string, opt *mountlib.Options) (<-chan error,
 	fs.Debugf(nil, "Mounting on %q (%q)", mountpoint, opt.VolumeName)
 
 	// Create underlying FS
-	fsys := NewFS(VFS)
+	fsys := NewFS(VFS, opt)
 	host := fuse.NewFileSystemHost(fsys)
 	host.SetCapReaddirPlus(true) // only works on Windows
 	if opt.CaseInsensitive.Valid {
@@ -174,7 +152,11 @@ func mount(VFS *vfs.VFS, mountPath string, opt *mountlib.Options) (<-chan error,
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				errChan <- fmt.Errorf("mount failed: %v", r)
+				err := fmt.Errorf("mount failed: %v", r)
+				if strings.Contains(strings.ToLower(err.Error()), "cannot find winfsp") {
+					err = fmt.Errorf("%w\nHint: Install WinFsp from https://winfsp.dev/rel/", err)
+				}
+				errChan <- err
 			}
 		}()
 		var err error

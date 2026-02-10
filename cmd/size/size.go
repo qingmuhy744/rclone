@@ -4,7 +4,6 @@ package size
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"strconv"
 
@@ -26,8 +25,7 @@ func init() {
 var commandDefinition = &cobra.Command{
 	Use:   "size remote:path",
 	Short: `Prints the total size and number of objects in remote:path.`,
-	Long: `
-Counts objects in the path and calculates the total size. Prints the
+	Long: `Counts objects in the path and calculates the total size. Prints the
 result to standard output.
 
 By default the output is in human-readable format, but shows values in
@@ -43,8 +41,7 @@ Some backends do not always provide file sizes, see for example
 [Google Docs](/drive/#limitations-of-google-docs).
 Rclone will then show a notice in the log indicating how many such
 files were encountered, and count them in as empty files in the output
-of the size command.
-`,
+of the size command.`,
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.23",
 		"groups":            "Filter,Listing",
@@ -73,13 +70,13 @@ of the size command.
 			count := strconv.FormatInt(results.Count, 10)
 			countSuffix := fs.CountSuffix(results.Count).String()
 			if count == countSuffix {
-				fmt.Printf("Total objects: %s\n", count)
+				operations.SyncPrintf("Total objects: %s\n", count)
 			} else {
-				fmt.Printf("Total objects: %s (%s)\n", countSuffix, count)
+				operations.SyncPrintf("Total objects: %s (%s)\n", countSuffix, count)
 			}
-			fmt.Printf("Total size: %s (%d Byte)\n", fs.SizeSuffix(results.Bytes).ByteUnit(), results.Bytes)
+			operations.SyncPrintf("Total size: %s (%d Byte)\n", fs.SizeSuffix(results.Bytes).ByteUnit(), results.Bytes)
 			if results.Sizeless > 0 {
-				fmt.Printf("Total objects with unknown size: %s (%d)\n", fs.CountSuffix(results.Sizeless), results.Sizeless)
+				operations.SyncPrintf("Total objects with unknown size: %s (%d)\n", fs.CountSuffix(results.Sizeless), results.Sizeless)
 			}
 			return nil
 		})

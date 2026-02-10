@@ -18,7 +18,7 @@ var (
 
 func setup(t *testing.T) (*Cache, CreateFunc) {
 	called = 0
-	create := func(path string) (interface{}, bool, error) {
+	create := func(path string) (any, bool, error) {
 		assert.Equal(t, 0, called)
 		called++
 		switch path {
@@ -79,6 +79,22 @@ func TestGetError(t *testing.T) {
 	require.Equal(t, nil, f)
 
 	assert.Equal(t, 0, len(c.cache))
+}
+
+func TestPutErr(t *testing.T) {
+	c, create := setup(t)
+
+	assert.Equal(t, 0, len(c.cache))
+
+	c.PutErr("/alien", "slime", errSentinel)
+
+	assert.Equal(t, 1, len(c.cache))
+
+	fNew, err := c.Get("/alien", create)
+	require.Equal(t, errSentinel, err)
+	require.Equal(t, "slime", fNew)
+
+	assert.Equal(t, 1, len(c.cache))
 }
 
 func TestPut(t *testing.T) {
@@ -273,7 +289,7 @@ func TestDelete(t *testing.T) {
 }
 
 func TestDeletePrefix(t *testing.T) {
-	create := func(path string) (interface{}, bool, error) {
+	create := func(path string) (any, bool, error) {
 		return path, true, nil
 	}
 	c := New()
@@ -301,7 +317,7 @@ func TestDeletePrefix(t *testing.T) {
 
 func TestCacheRename(t *testing.T) {
 	c := New()
-	create := func(path string) (interface{}, bool, error) {
+	create := func(path string) (any, bool, error) {
 		return path, true, nil
 	}
 
@@ -337,10 +353,10 @@ func TestCacheRename(t *testing.T) {
 func TestCacheFinalize(t *testing.T) {
 	c := New()
 	numCalled := 0
-	c.SetFinalizer(func(v interface{}) {
+	c.SetFinalizer(func(v any) {
 		numCalled++
 	})
-	create := func(path string) (interface{}, bool, error) {
+	create := func(path string) (any, bool, error) {
 		return path, true, nil
 	}
 	_, _ = c.Get("ok", create)

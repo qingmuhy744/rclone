@@ -2,12 +2,16 @@ package accounting
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"runtime"
 	"testing"
 	"time"
 
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/rc"
+	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/rclone/rclone/fstest/testy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -102,11 +106,11 @@ func TestStatsGroupOperations(t *testing.T) {
 		runtime.GC()
 		runtime.ReadMemStats(&start)
 
-		for i := 0; i < count; i++ {
+		for i := range count {
 			sg.set(ctx, fmt.Sprintf("test-%d", i), NewStats(ctx))
 		}
 
-		for i := 0; i < count; i++ {
+		for i := range count {
 			sg.delete(fmt.Sprintf("test-%d", i))
 		}
 
@@ -122,7 +126,7 @@ func TestStatsGroupOperations(t *testing.T) {
 
 	testGroupStatsInfo := NewStatsGroup(ctx, "test-group")
 	require.NoError(t, testGroupStatsInfo.DeleteFile(ctx, 0))
-	for i := 0; i < 41; i++ {
+	for range 41 {
 		require.NoError(t, GlobalStats().DeleteFile(ctx, 0))
 	}
 
@@ -139,14 +143,35 @@ func TestStatsGroupOperations(t *testing.T) {
 	})
 
 	t.Run("core/stats", func(t *testing.T) {
+		tr := Stats(ctx).NewCheckingTransfer(mockobject.New("core-check"), "deleting")
+		// defer tr.Done(ctx, nil)
+		_ = tr // don't finish the transfer so we don't mess up the other tests
+		tr2 := Stats(ctx).NewTransfer(mockobject.New("core-transfer"), nil)
+		//defer tr2.Done(ctx, nil)
+		_ = tr2 // don't finish the transfer so we don't mess up the other tests
+
 		call := rc.Calls.Get("core/stats")
 		require.NotNil(t, call)
-		gotNoGroup, err := call.Fn(ctx, rc.Params{})
+
+		got, err := call.Fn(ctx, rc.Params{})
 		require.NoError(t, err)
-		gotGroup, err := call.Fn(ctx, rc.Params{"group": "test-group"})
+		assert.Equal(t, int64(42), got["deletes"])
+		data, err := json.Marshal(got["transferring"])
 		require.NoError(t, err)
-		assert.Equal(t, int64(42), gotNoGroup["deletes"])
-		assert.Equal(t, int64(1), gotGroup["deletes"])
+		assert.Contains(t, string(data), "core-transfer")
+		data, err = json.Marshal(got["checking"])
+		require.NoError(t, err)
+		assert.Contains(t, string(data), "core-check")
+
+		got, err = call.Fn(ctx, rc.Params{"short": true})
+		require.NoError(t, err)
+		assert.Equal(t, int64(42), got["deletes"])
+		assert.Nil(t, got["transferring"])
+		assert.Nil(t, got["checking"])
+
+		got, err = call.Fn(ctx, rc.Params{"group": "test-group"})
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), got["deletes"])
 	})
 
 	t.Run("core/transferred", func(t *testing.T) {
@@ -206,6 +231,43 @@ func TestStatsGroupOperations(t *testing.T) {
 	})
 }
 
+func TestCountError(t *testing.T) {
+	ctx := context.Background()
+	Start(ctx)
+	defer func() {
+		groups = newStatsGroups()
+	}()
+	t.Run("global stats", func(t *testing.T) {
+		GlobalStats().ResetCounters()
+		err := fs.CountError(ctx, fmt.Errorf("global err"))
+		assert.Equal(t, int64(1), GlobalStats().errors)
+
+		assert.True(t, fserrors.IsCounted(err))
+	})
+	t.Run("group stats", func(t *testing.T) {
+		statGroupName := fmt.Sprintf("%s-error_group", t.Name())
+		GlobalStats().ResetCounters()
+		stCtx := WithStatsGroup(ctx, statGroupName)
+		st := StatsGroup(stCtx, statGroupName)
+
+		err := fs.CountError(stCtx, fmt.Errorf("group err"))
+
+		assert.Equal(t, int64(0), GlobalStats().errors)
+		assert.Equal(t, int64(1), st.errors)
+		assert.True(t, fserrors.IsCounted(err))
+	})
+
+}
+
 func percentDiff(start, end uint64) uint64 {
-	return (start - end) * 100 / start
+	if start == 0 {
+		return 0 // Handle zero start value to avoid division by zero
+	}
+	var diff uint64
+	if end > start {
+		diff = end - start // Handle case where end is larger than start
+	} else {
+		diff = start - end
+	}
+	return (diff * 100) / start
 }

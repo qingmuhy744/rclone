@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	maxEntitiesPerPage = 1024
+	maxEntitiesPerPage = 1000
 	minSleep           = 200 * time.Millisecond
 	maxSleep           = 2 * time.Second
 	pacerBurst         = 1
@@ -193,7 +193,7 @@ func (o *Object) set(e *entity) {
 // Call linkbox with the query in opts and return result
 //
 // This will be checked for error and an error will be returned if Status != 1
-func getUnmarshaledResponse(ctx context.Context, f *Fs, opts *rest.Opts, result interface{}) error {
+func getUnmarshaledResponse(ctx context.Context, f *Fs, opts *rest.Opts, result any) error {
 	err := f.pacer.Call(func() (bool, error) {
 		resp, err := f.srv.CallJSON(ctx, opts, nil, &result)
 		return f.shouldRetry(ctx, resp, err)
@@ -219,7 +219,8 @@ type listAllFn func(*entity) bool
 // Search is a bit fussy about which characters match
 //
 // If the name doesn't match this then do an dir list instead
-var searchOK = regexp.MustCompile(`^[a-zA-Z0-9_ .]+$`)
+// N.B.: Linkbox doesn't support search by name that is longer than 50 chars
+var searchOK = regexp.MustCompile(`^[a-zA-Z0-9_ -.]{1,50}$`)
 
 // Lists the directory required calling the user function on each item found
 //
@@ -238,6 +239,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, name string, fn listAllF
 		// If name isn't good then do an unbounded search
 		name = ""
 	}
+
 OUTER:
 	for numberOfEntities == maxEntitiesPerPage {
 		pageNumber++
@@ -258,7 +260,6 @@ OUTER:
 		err = getUnmarshaledResponse(ctx, f, opts, &responseResult)
 		if err != nil {
 			return false, fmt.Errorf("getting files failed: %w", err)
-
 		}
 
 		numberOfEntities = len(responseResult.SearchData.Entities)
@@ -496,9 +497,6 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	}
 
 	f.dirCache.FlushDir(dir)
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -616,16 +614,36 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	case 1:
 		// upload file using link from first step
 		var res *http.Response
+		var location string
+
+		// Check to see if we are being redirected
+		opts := &rest.Opts{
+			Method:     "HEAD",
+			RootURL:    getFirstStepResult.Data.SignURL,
+			Options:    options,
+			NoRedirect: true,
+		}
+		err = o.fs.pacer.CallNoRetry(func() (bool, error) {
+			res, err = o.fs.srv.Call(ctx, opts)
+			return o.fs.shouldRetry(ctx, res, err)
+		})
+		if res != nil {
+			location = res.Header.Get("Location")
+			if location != "" {
+				// set the URL to the new Location
+				opts.RootURL = location
+				err = nil
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("head upload URL: %w", err)
+		}
 
 		file := io.MultiReader(bytes.NewReader(first10mBytes), in)
 
-		opts := &rest.Opts{
-			Method:        "PUT",
-			RootURL:       getFirstStepResult.Data.SignURL,
-			Options:       options,
-			Body:          file,
-			ContentLength: &size,
-		}
+		opts.Method = "PUT"
+		opts.Body = file
+		opts.ContentLength = &size
 
 		err = o.fs.pacer.CallNoRetry(func() (bool, error) {
 			res, err = o.fs.srv.Call(ctx, opts)

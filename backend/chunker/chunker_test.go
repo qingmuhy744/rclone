@@ -36,6 +36,7 @@ func TestIntegration(t *testing.T) {
 			"GetTier",
 			"SetTier",
 			"Metadata",
+			"SetMetadata",
 		},
 		UnimplementableFsMethods: []string{
 			"PublicLink",
@@ -45,6 +46,7 @@ func TestIntegration(t *testing.T) {
 			"DirCacheFlush",
 			"UserInfo",
 			"Disconnect",
+			"ListP",
 		},
 	}
 	if *fstest.RemoteName == "" {

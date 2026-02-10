@@ -57,14 +57,19 @@ type Run struct {
 	Precision    time.Duration
 	cleanRemote  func()
 	mkdir        map[string]bool // whether the remote has been made yet for the fs name
-	Logf, Fatalf func(text string, args ...interface{})
+	Logf, Fatalf func(text string, args ...any)
+}
+
+// ResetRun re-reads the command line arguments into the global run.
+func ResetRun() {
+	oneRun = newRun()
 }
 
 // TestMain drives the tests
 func TestMain(m *testing.M) {
 	flag.Parse()
 	if !*Individual {
-		oneRun = newRun()
+		ResetRun()
 	}
 	rc := m.Run()
 	if !*Individual {
@@ -358,6 +363,20 @@ func (r *Run) CheckLocalListing(t *testing.T, items []Item, expectedDirs []strin
 // directories.
 func (r *Run) CheckRemoteListing(t *testing.T, items []Item, expectedDirs []string) {
 	CheckListingWithPrecision(t, r.Fremote, items, expectedDirs, r.Precision)
+}
+
+// CheckDirectoryModTimes checks that the directory names in r.Flocal has the correct modtime compared to r.Fremote
+func (r *Run) CheckDirectoryModTimes(t *testing.T, names ...string) {
+	if r.Fremote.Features().DirSetModTime == nil && r.Fremote.Features().MkdirMetadata == nil {
+		fs.Debugf(r.Fremote, "Skipping modtime test as remote does not support DirSetModTime or MkdirMetadata")
+		return
+	}
+	ctx := context.Background()
+	for _, name := range names {
+		wantT := NewDirectory(ctx, t, r.Flocal, name).ModTime(ctx)
+		got := NewDirectory(ctx, t, r.Fremote, name)
+		CheckDirModTime(ctx, t, r.Fremote, got, wantT)
+	}
 }
 
 // Clean the temporary directory

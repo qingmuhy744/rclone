@@ -84,8 +84,7 @@ func CreateFromStdinArg(ht hash.Type, args []string, startArg int) (bool, error)
 var commandDefinition = &cobra.Command{
 	Use:   "hashsum [<hash> remote:path]",
 	Short: `Produces a hashsum file for all the objects in the path.`,
-	Long: `
-Produces a hash file for all the objects in the path using the hash
+	Long: `Produces a hash file for all the objects in the path using the hash
 named.  The output is in the same format as the standard
 md5sum/sha1sum tool.
 
@@ -104,14 +103,17 @@ as a relative path).
 
 Run without a hash to see the list of all supported hashes, e.g.
 
-    $ rclone hashsum
-` + hash.HelpString(4) + `
+` + "```console" + `
+$ rclone hashsum
+` + hash.HelpString(0) + "```" + `
+
 Then
 
-    $ rclone hashsum MD5 remote:path
+` + "```console" + `
+rclone hashsum MD5 remote:path
+` + "```" + `
 
-Note that hash names are case insensitive and values are output in lower case.
-`,
+Note that hash names are case insensitive and values are output in lower case.`,
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.41",
 		"groups":            "Filter,Listing",

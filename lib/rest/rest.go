@@ -11,9 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/rclone/rclone/fs"
@@ -144,11 +147,15 @@ type Opts struct {
 	MultipartMetadataName string       // ..this is used for the name of the metadata form part if set
 	MultipartContentName  string       // ..name of the parameter which is the attached file
 	MultipartFileName     string       // ..name of the file for the attached file
+	MultipartContentType  string       // ..content type of the attached file
 	Parameters            url.Values   // any parameters for the final URL
 	TransferEncoding      []string     // transfer encoding, set to "identity" to disable chunked encoding
 	Trailer               *http.Header // set the request trailer
 	Close                 bool         // set to close the connection after this transaction
 	NoRedirect            bool         // if this is set then the client won't follow redirects
+	// On Redirects, call this function - see the http.Client docs: https://pkg.go.dev/net/http#Client
+	CheckRedirect func(req *http.Request, via []*http.Request) error
+	AuthRedirect  bool // if this is set then the client will redirect with Auth
 }
 
 // Copy creates a copy of the options
@@ -183,14 +190,14 @@ func checkDrainAndClose(r io.ReadCloser, err *error) {
 }
 
 // DecodeJSON decodes resp.Body into result
-func DecodeJSON(resp *http.Response, result interface{}) (err error) {
+func DecodeJSON(resp *http.Response, result any) (err error) {
 	defer checkDrainAndClose(resp.Body, &err)
 	decoder := json.NewDecoder(resp.Body)
 	return decoder.Decode(result)
 }
 
 // DecodeXML decodes resp.Body into result
-func DecodeXML(resp *http.Response, result interface{}) (err error) {
+func DecodeXML(resp *http.Response, result any) (err error) {
 	defer checkDrainAndClose(resp.Body, &err)
 	decoder := xml.NewDecoder(resp.Body)
 	// MEGAcmd has included escaped HTML entities in its XML output, so we have to be able to
@@ -205,6 +212,39 @@ func ClientWithNoRedirects(c *http.Client) *http.Client {
 	clientCopy := *c
 	clientCopy.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
+	}
+	return &clientCopy
+}
+
+// Do calls the internal http.Client.Do method
+func (api *Client) Do(req *http.Request) (*http.Response, error) {
+	return api.c.Do(req)
+}
+
+// ClientWithAuthRedirects makes a new http client which will re-apply Auth on redirects
+func ClientWithAuthRedirects(c *http.Client) *http.Client {
+	clientCopy := *c
+	clientCopy.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		} else if len(via) == 0 {
+			return nil
+		}
+		prevReq := via[len(via)-1]
+		resp := req.Response
+		if resp == nil {
+			return nil
+		}
+		// Look at previous response to see if it was a redirect and preserve auth if so
+		switch resp.StatusCode {
+		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+			// Reapply Auth (if any) from previous request on redirect
+			auth := prevReq.Header.Get("Authorization")
+			if auth != "" {
+				req.Header.Add("Authorization", auth)
+			}
+		}
+		return nil
 	}
 	return &clientCopy
 }
@@ -231,7 +271,7 @@ func (api *Client) Call(ctx context.Context, opts *Opts) (resp *http.Response, e
 		return nil, errors.New("RootURL not set")
 	}
 	url += opts.Path
-	if opts.Parameters != nil && len(opts.Parameters) > 0 {
+	if len(opts.Parameters) > 0 {
 		url += "?" + opts.Parameters.Encode()
 	}
 	body := readers.NoCloser(opts.Body)
@@ -250,9 +290,7 @@ func (api *Client) Call(ctx context.Context, opts *Opts) (resp *http.Response, e
 	}
 	headers := make(map[string]string)
 	// Set default headers
-	for k, v := range api.headers {
-		headers[k] = v
-	}
+	maps.Copy(headers, api.headers)
 	if opts.ContentType != "" {
 		headers["Content-Type"] = opts.ContentType
 	}
@@ -275,9 +313,7 @@ func (api *Client) Call(ctx context.Context, opts *Opts) (resp *http.Response, e
 		req.Close = true
 	}
 	// Set any extra headers
-	for k, v := range opts.ExtraHeaders {
-		headers[k] = v
-	}
+	maps.Copy(headers, opts.ExtraHeaders)
 	// add any options to the headers
 	fs.OpenOptionAddHeaders(opts.Options, headers)
 	// Now set the headers
@@ -299,6 +335,12 @@ func (api *Client) Call(ctx context.Context, opts *Opts) (resp *http.Response, e
 	var c *http.Client
 	if opts.NoRedirect {
 		c = ClientWithNoRedirects(api.c)
+	} else if opts.CheckRedirect != nil {
+		clientCopy := *api.c
+		clientCopy.CheckRedirect = opts.CheckRedirect
+		c = &clientCopy
+	} else if opts.AuthRedirect {
+		c = ClientWithAuthRedirects(api.c)
 	} else {
 		c = api.c
 	}
@@ -332,6 +374,32 @@ func (api *Client) Call(ctx context.Context, opts *Opts) (resp *http.Response, e
 	return resp, nil
 }
 
+var quoteEscaper = strings.NewReplacer("\\", "\\\\", `"`, "\\\"")
+
+func escapeQuotes(s string) string {
+	return quoteEscaper.Replace(s)
+}
+
+// multipartFileContentDisposition returns the value of a Content-Disposition header
+// with the provided field name and file name.
+func multipartFileContentDisposition(fieldname, filename string) string {
+	return fmt.Sprintf(`form-data; name="%s"; filename="%s"`,
+		escapeQuotes(fieldname), escapeQuotes(filename))
+}
+
+// CreateFormFile is a convenience wrapper around [Writer.CreatePart]. It creates
+// a new form-data header with the provided field name and file name.
+func CreateFormFile(w *multipart.Writer, fieldname, filename, contentType string) (io.Writer, error) {
+	h := make(textproto.MIMEHeader)
+	// FIXME when go1.24 is no longer supported, change to
+	// multipart.FileContentDisposition and remove definition above
+	h.Set("Content-Disposition", multipartFileContentDisposition(fieldname, filename))
+	if contentType != "" {
+		h.Set("Content-Type", contentType)
+	}
+	return w.CreatePart(h)
+}
+
 // MultipartUpload creates an io.Reader which produces an encoded a
 // multipart form upload from the params passed in and the  passed in
 //
@@ -343,10 +411,10 @@ func (api *Client) Call(ctx context.Context, opts *Opts) (resp *http.Response, e
 // the int64 returned is the overhead in addition to the file contents, in case Content-Length is required
 //
 // NB This doesn't allow setting the content type of the attachment
-func MultipartUpload(ctx context.Context, in io.Reader, params url.Values, contentName, fileName string) (io.ReadCloser, string, int64, error) {
+func MultipartUpload(ctx context.Context, in io.Reader, params url.Values, contentName, fileName string, contentType string) (io.ReadCloser, string, int64, error) {
 	bodyReader, bodyWriter := io.Pipe()
 	writer := multipart.NewWriter(bodyWriter)
-	contentType := writer.FormDataContentType()
+	formContentType := writer.FormDataContentType()
 
 	// Create a Multipart Writer as base for calculating the Content-Length
 	buf := &bytes.Buffer{}
@@ -365,7 +433,7 @@ func MultipartUpload(ctx context.Context, in io.Reader, params url.Values, conte
 		}
 	}
 	if in != nil {
-		_, err = dummyMultipartWriter.CreateFormFile(contentName, fileName)
+		_, err = CreateFormFile(dummyMultipartWriter, contentName, fileName, contentType)
 		if err != nil {
 			return nil, "", 0, err
 		}
@@ -406,7 +474,7 @@ func MultipartUpload(ctx context.Context, in io.Reader, params url.Values, conte
 		}
 
 		if in != nil {
-			part, err := writer.CreateFormFile(contentName, fileName)
+			part, err := CreateFormFile(writer, contentName, fileName, contentType)
 			if err != nil {
 				_ = bodyWriter.CloseWithError(fmt.Errorf("failed to create form file: %w", err))
 				return
@@ -428,7 +496,7 @@ func MultipartUpload(ctx context.Context, in io.Reader, params url.Values, conte
 		_ = bodyWriter.Close()
 	}()
 
-	return bodyReader, contentType, multipartLength, nil
+	return bodyReader, formContentType, multipartLength, nil
 }
 
 // CallJSON runs Call and decodes the body as a JSON object into response (if not nil)
@@ -450,7 +518,7 @@ func MultipartUpload(ctx context.Context, in io.Reader, params url.Values, conte
 // parameter name MultipartMetadataName.
 //
 // It will return resp if at all possible, even if err is set
-func (api *Client) CallJSON(ctx context.Context, opts *Opts, request interface{}, response interface{}) (resp *http.Response, err error) {
+func (api *Client) CallJSON(ctx context.Context, opts *Opts, request any, response any) (resp *http.Response, err error) {
 	return api.callCodec(ctx, opts, request, response, json.Marshal, DecodeJSON, "application/json")
 }
 
@@ -467,14 +535,14 @@ func (api *Client) CallJSON(ctx context.Context, opts *Opts, request interface{}
 // See CallJSON for a description of MultipartParams and related opts.
 //
 // It will return resp if at all possible, even if err is set
-func (api *Client) CallXML(ctx context.Context, opts *Opts, request interface{}, response interface{}) (resp *http.Response, err error) {
+func (api *Client) CallXML(ctx context.Context, opts *Opts, request any, response any) (resp *http.Response, err error) {
 	return api.callCodec(ctx, opts, request, response, xml.Marshal, DecodeXML, "application/xml")
 }
 
-type marshalFn func(v interface{}) ([]byte, error)
-type decodeFn func(resp *http.Response, result interface{}) (err error)
+type marshalFn func(v any) ([]byte, error)
+type decodeFn func(resp *http.Response, result any) (err error)
 
-func (api *Client) callCodec(ctx context.Context, opts *Opts, request interface{}, response interface{}, marshal marshalFn, decode decodeFn, contentType string) (resp *http.Response, err error) {
+func (api *Client) callCodec(ctx context.Context, opts *Opts, request any, response any, marshal marshalFn, decode decodeFn, contentType string) (resp *http.Response, err error) {
 	var requestBody []byte
 	// Marshal the request if given
 	if request != nil {
@@ -500,7 +568,7 @@ func (api *Client) callCodec(ctx context.Context, opts *Opts, request interface{
 		opts = opts.Copy()
 
 		var overhead int64
-		opts.Body, opts.ContentType, overhead, err = MultipartUpload(ctx, opts.Body, params, opts.MultipartContentName, opts.MultipartFileName)
+		opts.Body, opts.ContentType, overhead, err = MultipartUpload(ctx, opts.Body, params, opts.MultipartContentName, opts.MultipartFileName, opts.MultipartContentType)
 		if err != nil {
 			return nil, err
 		}

@@ -13,8 +13,28 @@ docs](https://docs.aws.amazon.com/general/latest/gr/signature-version-4.html)).
 `--auth-key` is not provided then `serve s3` will allow anonymous
 access.
 
+Like all rclone flags `--auth-key` can be set via environment
+variables, in this case `RCLONE_AUTH_KEY`. Since this flag can be
+repeated, the input to `RCLONE_AUTH_KEY` is CSV encoded. Because the
+`accessKey,secretKey` has a comma in, this means it needs to be in
+quotes.
+
+```console
+export RCLONE_AUTH_KEY='"user,pass"'
+rclone serve s3 ...
+```
+
+Or to supply multiple identities:
+
+```console
+export RCLONE_AUTH_KEY='"user1,pass1","user2,pass2"'
+rclone serve s3 ...
+```
+
+Setting this variable without quotes will produce an error.
+
 Please note that some clients may require HTTPS endpoints. See [the
-SSL docs](#ssl-tls) for more information.
+SSL docs](#tls-ssl) for more information.
 
 This command uses the [VFS directory cache](#vfs-virtual-file-system).
 All the functionality will work with `--vfs-cache-mode off`. Using
@@ -33,13 +53,33 @@ cause problems for S3 clients which rely on the Etag being the MD5.
 For a simple set up, to serve `remote:path` over s3, run the server
 like this:
 
-```
+```console
 rclone serve s3 --auth-key ACCESS_KEY_ID,SECRET_ACCESS_KEY remote:path
 ```
 
-This will be compatible with an rclone remote which is defined like this:
+For example, to use a simple folder in the filesystem, run the server
+with a command like this:
 
+```console
+rclone serve s3 --auth-key ACCESS_KEY_ID,SECRET_ACCESS_KEY local:/path/to/folder
 ```
+
+The `rclone.conf` for the server could look like this:
+
+```ini
+[local]
+type = local
+```
+
+The `local` configuration is optional though. If you run the server with a
+`remote:path` like `/path/to/folder` (without the `local:` prefix and without an
+`rclone.conf` file), rclone will fall back to a default configuration, which
+will be visible as a warning in the logs. But it will run nonetheless.
+
+This will be compatible with an rclone (client) remote configuration which
+is defined like this:
+
+```ini
 [serves3]
 type = s3
 provider = Rclone
@@ -49,7 +89,7 @@ secret_access_key = SECRET_ACCESS_KEY
 use_multipart_uploads = false
 ```
 
-Note that setting `disable_multipart_uploads = true` is to work around
+Note that setting `use_multipart_uploads = false` is to work around
 [a bug](#bugs) which will be fixed in due course.
 
 ### Bugs
@@ -96,20 +136,20 @@ metadata which will be set as the modification time of the file.
 `serve s3` currently supports the following operations.
 
 - Bucket
-    - `ListBuckets`
-    - `CreateBucket`
-    - `DeleteBucket`
+  - `ListBuckets`
+  - `CreateBucket`
+  - `DeleteBucket`
 - Object
-    - `HeadObject`
-    - `ListObjects`
-    - `GetObject`
-    - `PutObject`
-    - `DeleteObject`
-    - `DeleteObjects`
-    - `CreateMultipartUpload`
-    - `CompleteMultipartUpload`
-    - `AbortMultipartUpload`
-    - `CopyObject`
-    - `UploadPart`
+  - `HeadObject`
+  - `ListObjects`
+  - `GetObject`
+  - `PutObject`
+  - `DeleteObject`
+  - `DeleteObjects`
+  - `CreateMultipartUpload`
+  - `CompleteMultipartUpload`
+  - `AbortMultipartUpload`
+  - `CopyObject`
+  - `UploadPart`
 
 Other operations will return error `Unimplemented`.

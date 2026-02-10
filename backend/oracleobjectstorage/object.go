@@ -1,5 +1,4 @@
 //go:build !plan9 && !solaris && !js
-// +build !plan9,!solaris,!js
 
 package oracleobjectstorage
 
@@ -132,7 +131,7 @@ func (o *Object) setMetaData(
 	contentMd5 *string,
 	contentType *string,
 	lastModified *common.SDKTime,
-	storageTier interface{},
+	storageTier any,
 	meta map[string]string) error {
 
 	if contentLength != nil {

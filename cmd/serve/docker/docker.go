@@ -5,12 +5,14 @@ import (
 	"context"
 	_ "embed"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
 
 	"github.com/rclone/rclone/cmd"
 	"github.com/rclone/rclone/cmd/mountlib"
+	"github.com/rclone/rclone/cmd/serve"
 	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfsflags"
@@ -33,6 +35,11 @@ var (
 //go:embed docker.md
 var longHelp string
 
+// help returns the help string cleaned up to simplify appending
+func help() string {
+	return strings.TrimSpace(longHelp) + "\n\n"
+}
+
 func init() {
 	cmdFlags := Command.Flags()
 	// Add command specific flags
@@ -44,13 +51,15 @@ func init() {
 	// Add common mount/vfs flags
 	mountlib.AddFlags(cmdFlags)
 	vfsflags.AddFlags(cmdFlags)
+	// Register with parent command
+	serve.Command.AddCommand(Command)
 }
 
 // Command definition for cobra
 var Command = &cobra.Command{
 	Use:   "docker",
 	Short: `Serve any remote on docker's volume plugin API.`,
-	Long:  longHelp + vfs.Help,
+	Long:  help() + strings.TrimSpace(vfs.Help()),
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.56",
 		"groups":            "Filter",
