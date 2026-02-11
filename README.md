@@ -24,15 +24,25 @@
 
 ## Key Enhancements in this Fork
 
-- **Bypy-style Streaming Upload**: Re-implemented the Baidu upload logic to
-  use in-memory chunking. Enjoy **zero additional disk overhead** even when
-  uploading terabyte-sized files.
-- **Rapid Upload (秒传) Support**: Automatically calculates MD5, Slice-MD5,
-  and CRC32 to instantly upload files already present on Baidu servers.
-- **Pipe/Stream Friendly**: Fully supports uploading from standard input or
-  pipes without temporary files.
+- **Optimized Chunked Upload**: Re-implemented Baidu upload logic with intelligent
+  caching strategies. Uses **memory buffering for small files** and **disk spooling 
+  for large files** to handle uploads efficiently without OOM issues.
+- **AsyncReader Compatibility**: Fully compatible with rclone's AsyncReader wrapper,
+  which provides asynchronous read-ahead buffering for improved throughput.
+- **Stream-Friendly**: Supports uploading from standard input, pipes, and network
+  streams through adaptive caching (memory for ≤128MB, temp files for larger).
 - **Docker GHCR Integration**: Automated CI pushes multi-arch images directly
   to GitHub Container Registry (`ghcr.io/qingmuhy744/rclone`).
+
+### Technical Notes
+
+- **No Rapid Upload**: Due to rclone's AsyncReader wrapping (which improves performance
+  but removes Seek capability), rapid upload (秒传) is not supported. The framework
+  prevents access to original file paths required for pre-calculating hashes.
+- **Baidu API Limitations**: Baidu's pre-upload API requires submitting all chunk MD5
+  hashes before uploading data, which conflicts with stream-based uploads. Current
+  implementation uses caching to work around this design.
+
 
 ---
 

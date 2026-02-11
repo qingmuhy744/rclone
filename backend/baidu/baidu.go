@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"net/http"
 	"net/url"
@@ -34,7 +33,7 @@ const (
 	uploadURL  = "https://c.pcs.baidu.com"
 	rootID     = "/"
 
-	//uri
+	// API endpoints
 	uriOauthCode  = "/oauth/2.0/device/code"
 	uriOauthToken = "/oauth/2.0/token"
 	uriFile       = "/rest/2.0/xpan/file"
@@ -43,9 +42,8 @@ const (
 	uriMultimedia = "/rest/2.0/xpan/multimedia"
 	uriQuota      = "/api/quota"
 
-	//
-	chunkSize            = 4 * 1024 * 1024 // 分片大小锁定为 4M (官方黄金标准，普通用户与会员通用)
-	rapidUploadThreshold = 256 * 1024      // 秒传阈值 256KB
+	// Upload configuration
+	chunkSize = 4 * 1024 * 1024 // Chunk size fixed at 4MB (official standard for all user types)
 )
 
 // Options defines the configuration for this backend
@@ -129,7 +127,7 @@ func getAccessToken(ctx context.Context, deviceCode, appKey, secretKey string) (
 	return resp, err
 }
 
-// 授权
+// authCode requests device authorization code from Baidu OAuth2 API
 func authCode(ctx context.Context, appKey string) (*AuthCodeOut, error) {
 	c := rest.NewClient(fshttp.NewClient(ctx))
 	opts := &rest.Opts{
@@ -209,12 +207,12 @@ type Fs struct {
 }
 
 func (f *Fs) call(ctx context.Context, opts *rest.Opts, response interface{}) error {
-	//设置AccessToken
+	// Set access token for API requests
 	opts.Parameters.Set("access_token", f.opt.AccessToken)
 	if opts.ExtraHeaders == nil {
 		opts.ExtraHeaders = make(map[string]string)
 	}
-	// 伪装为百度云管家，提高兼容性
+	// Impersonate Baidu Cloud Manager client for better compatibility
 	opts.ExtraHeaders["User-Agent"] = "netdisk;P2SP;8.3.1.2;PC;PC-Windows;10.0.19042;WindowsBaiduYunGuanJia"
 	resp, err := f.srv.Call(ctx, opts)
 	if err != nil {
@@ -227,7 +225,7 @@ func (f *Fs) call(ctx context.Context, opts *rest.Opts, response interface{}) er
 	if err != nil {
 		return fmt.Errorf("failed to unmarshal error response: %w", err)
 	}
-	// 同时检查 errno 和 error_code
+	// Check both errno and error_code for API errors
 	if respError.Errno != 0 || respError.ErrorCode != 0 {
 		errno := respError.Errno
 		errmsg := respError.ErrMsg
@@ -256,7 +254,7 @@ func (f *Fs) fullPath(remote string) string {
 }
 
 func (f *Fs) download(ctx context.Context, opts *rest.Opts) (resp *http.Response, err error) {
-	//设置AccessToken
+	// Set access token for API requests
 	//opts.Parameters.Set("access_token", f.opt.AccessToken)
 	f.downloadSrv.SetHeader("Host", "d.pcs.baidu.com")
 	return f.downloadSrv.Call(ctx, opts)
@@ -290,7 +288,7 @@ func (f *Fs) refreshToken() error {
 	return configstruct.Set(f.m, f.opt)
 }
 
-// Name 返回名称
+// Name returns the name of this backend
 func (f *Fs) Name() string {
 	return f.name
 }
@@ -397,7 +395,7 @@ func (f *Fs) listDirFile(ctx context.Context, dir string, start, limit int) ([]F
 	err := f.call(ctx, opts, resp)
 	if err != nil {
 		if strings.Contains(err.Error(), "errno: -9") {
-			return nil, nil // 路径不存在或不是目录，返回空列表
+			return nil, nil // Path doesn't exist or is not a directory, return empty list
 		}
 		return nil, err
 	}
@@ -459,7 +457,7 @@ func (f *Fs) newObject(path string, size int64) *Object {
 	return &Object{fs: f, remote: path, path: path, size: size, modTime: time.Now()}
 }
 
-// 文件操作统一方法
+// fileOperation is a unified method for file operations (copy/move)
 func (f *Fs) fileManager(ctx context.Context, opera, fileList string) error {
 	opts := &rest.Opts{
 		Method:  "POST",
@@ -574,7 +572,9 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	}
 	resp := MkdirOut{}
 	err := f.call(ctx, opts, &resp)
-	if err != nil && strings.Contains(err.Error(), "errno: -9") {
+	if err != nil && (strings.Contains(err.Error(), "errno: -8") || strings.Contains(err.Error(), "errno: -9")) {
+		// -8: file already exists, -9: directory already exists
+		// According to Mkdir spec, we shouldn't return an error if it already exists
 		return nil
 	}
 	return err
@@ -629,7 +629,7 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	}
 	free := resp.Total - resp.Used
 	usage = &fs.Usage{
-		Free:  &free, // 百度接口返回 Free 常为 0，在此手动计算以满足 rclone 展示
+		Free:  &free, // Baidu API often returns Free=0, manually calculated for rclone display
 		Total: &resp.Total,
 		Used:  &resp.Used,
 	}
@@ -751,41 +751,38 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 func (o *Object) upload(ctx context.Context, in io.Reader, size int64) error {
 	remote := o.fs.fullPath(o.remote)
 
-	// 1. 尝试秒传
-	if size > rapidUploadThreshold {
-		if f, ok := in.(*os.File); ok {
-			contentMD5, sliceMD5, crc32Val, err := o.computeLocalHashes(f.Name())
-			if err == nil {
-				err = o.rapidUpload(ctx, remote, contentMD5, sliceMD5, crc32Val, size)
-				if err == nil {
-					return nil // 秒传成功
-				}
-				fs.Debugf(o, "秒传失败: %v，转普通上传", err)
-			}
-		}
-	}
+	// Log upload information and reader type detection
+	_, isSeeker := in.(io.ReadSeeker)
+	_, isAsyncReader := in.(interface{ Abandon() })
+	fs.Debugf(o, "Starting upload: size=%d, isSeeker=%v, isAsyncReader=%v", size, isSeeker, isAsyncReader)
 
-	// 2. 对于 4MB 以下文件，使用单次上传 (Simple Upload)
-	// 根据官方文档，4MB 以上必须分片，PCS 的简单上传通道在超限时会不稳定 (易中断)
+	// Note: Rapid upload is not supported due to rclone's AsyncReader wrapper.
+	// The AsyncReader provides read-ahead buffering for performance but prevents
+	// access to the original file path needed for hash pre-calculation.
+	// This is a deliberate design trade-off in rclone that prioritizes throughput
+	// over Seek capability.
+
+	// 1. For files ≤4MB, use simple upload (single request)
+	// According to Baidu docs, files >4MB must use chunked upload.
+	// The PCS simple upload endpoint becomes unstable for large files.
 	if size <= 4*1024*1024 && size >= 0 {
 		return o.simpleUpload(ctx, in, size)
 	}
 
-	// 3. 超过 4MB 使用 XPAN 分片上传 (superfile2)
-	// 3. 超过 4MB 使用 XPAN 分片上传 (superfile2)
-	// 注意：由于 rclone 内部可能使用 AsyncReader 包装，无法可靠检测 Seek 支持
-	// 因此统一使用 Disk Spooling 模式（写盘缓存）处理大文件，避免内存 OOM
+	// 2. For files >4MB, use XPAN chunked upload (superfile2 API)
+	// Note: Due to rclone's AsyncReader wrapper, Seek detection is unreliable.
+	// We use disk spooling for large files to avoid OOM issues.
 
 	var md5s []string
 	var uploadSource io.ReaderAt
-	// 如果是 Seeker（本地文件），可以直接使用
+	// If the input is a Seeker (e.g., local file), try to use it directly
 	if seeker, ok := in.(io.ReadSeeker); ok {
-		// 再次尝试 Seek Detect，排除 AsyncReader 的假实现
+		// Double-check Seek capability to filter out AsyncReader's stub implementation
 		if _, err := seeker.Seek(0, io.SeekCurrent); err == nil {
-			fs.Debugf(o, "检测到本地文件流，开启双读流式上传模式")
+			fs.Debugf(o, "✓ Seek detection successful, using zero-copy dual-read mode (local file optimization)")
 			uploadSource = seeker.(io.ReaderAt) // os.File implements ReaderAt
 
-			// 第一遍：计算所有分片的 MD5
+			// First pass: calculate MD5 for all chunks
 			buf := make([]byte, chunkSize)
 			for {
 				n, err := io.ReadFull(seeker, buf)
@@ -798,29 +795,29 @@ func (o *Object) upload(ctx context.Context, in io.Reader, size int64) error {
 					break
 				}
 				if err != nil {
-					return fmt.Errorf("扫描文件 MD5 失败: %w", err)
+					return fmt.Errorf("failed to scan file MD5: %w", err)
 				}
 			}
 
-			// 复位偏移量
+			// Reset file pointer to beginning
 			if _, err := seeker.Seek(0, io.SeekStart); err != nil {
-				return fmt.Errorf("复位文件指针失败: %w", err)
+				return fmt.Errorf("failed to reset file pointer: %w", err)
 			}
 
 			goto DoUpload
 		}
 	}
 
-	// 如果非 Seeker 且文件较大 (>128MB)，使用临时文件缓存，避免内存溢出
+	// For large non-seekable streams (>128MB), use temp file caching to avoid OOM
 	if size > 128*1024*1024 {
-		fs.Debugf(o, "大文件上传 (>128MB) 且无法 Seek，启用磁盘缓存模式...")
+		fs.Debugf(o, "→ Large file upload (%.2fMB), non-seekable, enabling disk cache mode", float64(size)/(1024*1024))
 		tempFile, err := os.CreateTemp("", "rclone-baidu-upload-*")
 		if err != nil {
-			return fmt.Errorf("创建临时缓存文件失败: %w", err)
+			return fmt.Errorf("failed to create temp cache file: %w", err)
 		}
 		defer func() {
-			tempFile.Close()
-			os.Remove(tempFile.Name())
+			_ = tempFile.Close()
+			_ = os.Remove(tempFile.Name())
 		}()
 
 		uploadSource = tempFile // os.File implements ReaderAt
@@ -829,12 +826,12 @@ func (o *Object) upload(ctx context.Context, in io.Reader, size int64) error {
 		for {
 			n, err := io.ReadFull(in, buf)
 			if n > 0 {
-				// 写入临时文件
+				// Write to temp file
 				if _, err := tempFile.Write(buf[:n]); err != nil {
-					return fmt.Errorf("写入临时缓存文件失败: %w", err)
+					return fmt.Errorf("failed to write to temp cache file: %w", err)
 				}
 
-				// 计算 MD5
+				// Calculate MD5
 				h := md5.New()
 				h.Write(buf[:n])
 				md5s = append(md5s, hex.EncodeToString(h.Sum(nil)))
@@ -847,17 +844,17 @@ func (o *Object) upload(ctx context.Context, in io.Reader, size int64) error {
 			}
 		}
 
-		// 确保数据落盘
+		// Ensure data is flushed to disk
 		if err := tempFile.Sync(); err != nil {
-			return fmt.Errorf("同步临时文件失败: %w", err)
+			return fmt.Errorf("failed to sync temp file: %w", err)
 		}
 
 		goto DoUpload
 	}
 
-	// 4. 对于较小的流式输入 (<=128MB)，缓冲至内存 (速度快)
+	// 3. For smaller stream inputs (≤128MB), buffer in memory (faster)
 	{
-		fs.Debugf(o, "小文件流式上传 (<=128MB)，全量缓存至内存处理...")
+		fs.Debugf(o, "→ Small file stream upload (%.2fMB), non-seekable, using memory cache mode", float64(size)/(1024*1024))
 		var chunks [][]byte
 		buf := make([]byte, chunkSize)
 
@@ -882,21 +879,21 @@ func (o *Object) upload(ctx context.Context, in io.Reader, size int64) error {
 
 		preResp, err := o.precreate(ctx, remote, size, md5s)
 		if err != nil {
-			return fmt.Errorf("precreate 失败: %w", err)
+			return fmt.Errorf("precreate failed: %w", err)
 		}
 		uploadID := preResp.UploadID
 
 		for i, chunkData := range chunks {
 			_, err := o.sliceUpload(ctx, remote, uploadID, i, bytes.NewReader(chunkData), int64(len(chunkData)))
 			if err != nil {
-				return fmt.Errorf("分片 %d 上传失败: %w", i, err)
+				return fmt.Errorf("slice %d upload failed: %w", i, err)
 			}
 		}
 
 		md5ListBytes, _ := json.Marshal(md5s)
 		file, err := o.complete(ctx, remote, uploadID, size, string(md5ListBytes))
 		if err != nil {
-			return fmt.Errorf("合并文件失败: %w", err)
+			return fmt.Errorf("failed to merge file: %w", err)
 		}
 		o.id = strconv.FormatUint(file.FsID, 10)
 		o.path = file.Path
@@ -906,7 +903,7 @@ func (o *Object) upload(ctx context.Context, in io.Reader, size int64) error {
 DoUpload:
 	preResp, err := o.precreate(ctx, remote, size, md5s)
 	if err != nil {
-		return fmt.Errorf("precreate 失败: %w", err)
+		return fmt.Errorf("precreate failed: %w", err)
 	}
 	uploadID := preResp.UploadID
 
@@ -918,18 +915,18 @@ DoUpload:
 			currentChunkSize = int64(chunkSize)
 		}
 
-		// 使用 SectionReader 读取指定分片
-		// uploadSource 必须是 io.ReaderAt (os.File 满足)
+		// Use SectionReader to read specific chunk
+		// uploadSource must be io.ReaderAt (os.File satisfies this)
 		sectionReader := io.NewSectionReader(uploadSource, int64(i)*int64(chunkSize), currentChunkSize)
 		if _, err := o.sliceUpload(ctx, remote, uploadID, i, sectionReader, currentChunkSize); err != nil {
-			return fmt.Errorf("分片 %d 上传失败: %w", i, err)
+			return fmt.Errorf("slice %d upload failed: %w", i, err)
 		}
 	}
 
 	md5ListBytes, _ := json.Marshal(md5s)
 	file, err := o.complete(ctx, remote, uploadID, size, string(md5ListBytes))
 	if err != nil {
-		return fmt.Errorf("合并文件失败: %w", err)
+		return fmt.Errorf("failed to merge file: %w", err)
 	}
 	o.id = strconv.FormatUint(file.FsID, 10)
 	o.path = file.Path
@@ -962,65 +959,7 @@ func (o *Object) precreate(ctx context.Context, remote string, size int64, md5s 
 	return resp, err
 }
 
-func (o *Object) computeLocalHashes(lpath string) (contentMD5, sliceMD5 string, crc32Val uint32, err error) {
-	f, err := os.Open(lpath)
-	if err != nil {
-		return "", "", 0, err
-	}
-	defer func() {
-		closeErr := f.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
-
-	hMD5 := md5.New()
-	hCRC32 := crc32.NewIEEE()
-	hSliceMD5 := md5.New()
-
-	mw := io.MultiWriter(hMD5, hCRC32)
-
-	// 读取前 256KB 算 Slice-MD5
-	limitReader := io.LimitReader(f, rapidUploadThreshold)
-	teeReader := io.TeeReader(limitReader, hSliceMD5)
-
-	_, err = io.Copy(mw, teeReader)
-	if err != nil {
-		return "", "", 0, err
-	}
-
-	// 读取剩余部分
-	_, err = io.Copy(mw, f)
-	if err != nil {
-		return "", "", 0, err
-	}
-
-	return hex.EncodeToString(hMD5.Sum(nil)), hex.EncodeToString(hSliceMD5.Sum(nil)), hCRC32.Sum32(), nil
-}
-
-// 秒传
-func (o *Object) rapidUpload(ctx context.Context, remote, contentMD5, sliceMD5 string, crc32Val uint32, size int64) error {
-	opts := &rest.Opts{
-		Method:  "POST",
-		RootURL: uploadURL,
-		Path:    uriPCSFile,
-		Parameters: map[string][]string{
-			"method":         {"rapidupload"},
-			"path":           {remote},
-			"content-length": {strconv.FormatInt(size, 10)},
-			"content-md5":    {contentMD5},
-			"slice-md5":      {sliceMD5},
-			"content-crc32":  {fmt.Sprintf("%d", crc32Val)},
-			"ondup":          {"overwrite"},
-			"openapi":        {"xpansdk"},
-		},
-	}
-	resp := RapidUploadOut{}
-	err := o.fs.call(ctx, opts, &resp)
-	return err
-}
-
-// 单次上传 (Simple Upload)
+// simpleUpload performs a single-part upload for files ≤4MB
 func (o *Object) simpleUpload(ctx context.Context, in io.Reader, size int64) error {
 	remote := o.fs.fullPath(o.remote)
 	formReader, contentType, overhead, err := rest.MultipartUpload(ctx, in, nil, "file", "file", "")
@@ -1055,7 +994,7 @@ func (o *Object) simpleUpload(ctx context.Context, in io.Reader, size int64) err
 	return nil
 }
 
-// 分片上传
+// sliceUpload uploads a single chunk of a multi-part upload
 func (o *Object) sliceUpload(ctx context.Context, remote, uploadID string, partSeq int, in io.Reader, size int64) (md5sum string, err error) {
 	formReader, contentType, overhead, err := rest.MultipartUpload(ctx, in, nil, "file", "file", "")
 	if err != nil {
@@ -1087,7 +1026,7 @@ func (o *Object) sliceUpload(ctx context.Context, remote, uploadID string, partS
 	return resp.Md5, err
 }
 
-// 合并上传 (create)
+// complete merges all uploaded chunks into a single file
 func (o *Object) complete(ctx context.Context, remote, uploadID string, size int64, md5ListJSON string) (FileEntity, error) {
 	v := url.Values{}
 	v.Set("path", remote)
@@ -1095,7 +1034,7 @@ func (o *Object) complete(ctx context.Context, remote, uploadID string, size int
 	v.Set("isdir", "0")
 	v.Set("rtype", "3")
 	v.Set("uploadid", uploadID)
-	// block_list 需要是 ["...", "..."] 的 JSON 数组格式
+	// block_list must be a JSON array format: ["...", "..."]
 	v.Set("block_list", md5ListJSON)
 	v.Set("openapi", "xpansdk")
 
@@ -1109,7 +1048,7 @@ func (o *Object) complete(ctx context.Context, remote, uploadID string, size int
 		Body:        strings.NewReader(v.Encode()),
 		ContentType: "application/x-www-form-urlencoded",
 	}
-	resp := MkdirOut{} // create 返回的结构与 mkdir 类似
+	resp := MkdirOut{} // create API returns structure similar to mkdir
 	err := o.fs.call(ctx, opts, &resp)
 	if err != nil {
 		return FileEntity{}, err
@@ -1150,7 +1089,8 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 		return nil
 	}
 
-	// XPAN 无法通过 path 直接获取 filemeta (errno: 2)，必须通过父目录 List 查找
+	// XPAN cannot retrieve file metadata directly by path (errno: 2)
+	// Must find the file through parent directory listing
 	dir, leaf := path.Split(o.fs.fullPath(o.remote))
 	list, err := o.fs.listDirAllFile(ctx, dir)
 	if err != nil {
